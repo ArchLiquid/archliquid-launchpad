@@ -125,6 +125,8 @@ contract ArchAdapterLaunchpadV2Test is Test {
         presale.finalize();
 
         ArchToken token = presale.token();
+        assertEq(token.TAX_BPS(), 300);
+        assertEq(address(token.STOCK()), address(stock));
         address pair = v2Factory.getPair(address(token), address(weth));
         assertEq(presale.pair(), pair);
         assertTrue(locker.isCanonicalPair(pair));
@@ -176,7 +178,12 @@ contract ArchAdapterLaunchpadV2Test is Test {
         vm.prank(keeper);
         token.processDistribution(1, 1);
         assertGt(token.totalDistributed(), 0);
-        assertGt(token.withdrawableDividendOf(alice), 0);
+        uint256 aliceClaimable = token.withdrawableDividendOf(alice);
+        assertGt(aliceClaimable, 0);
+        uint256 aliceStockBefore = stock.balanceOf(alice);
+        vm.prank(alice);
+        token.claim();
+        assertEq(stock.balanceOf(alice) - aliceStockBefore, aliceClaimable);
     }
 
     function test_curveGraduatesExactlyIntoPermanentV2Liquidity() public {

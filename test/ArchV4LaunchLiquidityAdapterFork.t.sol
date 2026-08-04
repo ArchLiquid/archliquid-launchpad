@@ -137,6 +137,8 @@ contract ArchV4LaunchLiquidityAdapterForkTest is Test {
             0,
             address(this)
         );
+        assertEq(launchToken.TAX_BPS(), 300);
+        assertEq(address(launchToken.STOCK()), address(stock));
 
         vm.deal(address(this), 60 ether);
         weth.deposit{value: 60 ether}();
@@ -224,6 +226,11 @@ contract ArchV4LaunchLiquidityAdapterForkTest is Test {
         launchToken.processDistribution(1, 1);
         assertGt(address(treasury).balance, treasuryBefore);
         assertGt(launchToken.totalDistributed(), 0);
-        assertGt(launchToken.withdrawableDividendOf(alice), 0);
+        uint256 aliceClaimable = launchToken.withdrawableDividendOf(alice);
+        assertGt(aliceClaimable, 0);
+        uint256 aliceStockBefore = stock.balanceOf(alice);
+        vm.prank(alice);
+        launchToken.claim();
+        assertEq(stock.balanceOf(alice) - aliceStockBefore, aliceClaimable);
     }
 }

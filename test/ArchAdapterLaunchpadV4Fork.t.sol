@@ -160,6 +160,8 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         presale.finalize();
 
         ArchToken token = presale.token();
+        assertEq(token.TAX_BPS(), 300);
+        assertEq(address(token.STOCK()), address(stock));
         ArchV4PositionLocker.Lock memory created = locker.getLock(0);
         assertEq(POSITION_MANAGER.ownerOf(created.tokenId), address(locker));
         assertEq(created.owner, creator);
@@ -189,7 +191,12 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         vm.prank(keeper);
         token.processDistribution(1, 1);
         assertGt(token.totalDistributed(), 0);
-        assertGt(token.withdrawableDividendOf(alice), 0);
+        uint256 aliceClaimable = token.withdrawableDividendOf(alice);
+        assertGt(aliceClaimable, 0);
+        uint256 aliceStockBefore = stock.balanceOf(alice);
+        vm.prank(alice);
+        token.claim();
+        assertEq(stock.balanceOf(alice) - aliceStockBefore, aliceClaimable);
     }
 
     function test_curveGraduatesIntoPermanentLiveV4Position() public {

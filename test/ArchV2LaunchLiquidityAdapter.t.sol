@@ -153,6 +153,8 @@ contract ArchV2LaunchLiquidityAdapterTest is Test {
             0,
             address(this)
         );
+        assertEq(launchToken.TAX_BPS(), 300);
+        assertEq(address(launchToken.STOCK()), address(stock));
 
         // Seed the stock/WETH output route on the same functional V2 fixture.
         stock.mint(address(this), 1_000_000e18);
@@ -226,6 +228,11 @@ contract ArchV2LaunchLiquidityAdapterTest is Test {
         launchToken.processDistribution(1, 1);
         assertGt(address(treasury).balance, treasuryBefore);
         assertGt(launchToken.totalDistributed(), 0);
-        assertGt(launchToken.withdrawableDividendOf(alice), 0);
+        uint256 aliceClaimable = launchToken.withdrawableDividendOf(alice);
+        assertGt(aliceClaimable, 0);
+        uint256 aliceStockBefore = stock.balanceOf(alice);
+        vm.prank(alice);
+        launchToken.claim();
+        assertEq(stock.balanceOf(alice) - aliceStockBefore, aliceClaimable);
     }
 }
