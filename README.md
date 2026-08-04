@@ -279,7 +279,7 @@ licenses.
 | Dependency | Commit |
 |---|---|
 | ArchLiquid Core | `b1f0bec05bdee32cdcb3dfa74310f2f5476760be` |
-| ArchLiquid Lockers | `5873bb7b455490714bd541008137b014e739a487` |
+| ArchLiquid Lockers | `f47efd092c263d1d185a777079413119b546b4ac` |
 | ArchLiquid Token | `b5cd8124c39a2e46bee19f74ea8f735178a0276b` |
 | Foundry standard library | `c179529c064588ede54a0661ec3cc98219460d07` |
 | OpenZeppelin Contracts | `5fd1781b1454fd1ef8e722282f86f9293cacf256` |
