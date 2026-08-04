@@ -4,8 +4,9 @@ pragma solidity 0.8.30;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IUniswapV2Factory, IUniswapV2Router02} from "@archliquid/core/interfaces/IUniswapV2.sol";
+import {IUniswapV2Factory, IUniswapV2Router02} from "../../src/interfaces/IUniswapV2.sol";
 import {INonfungiblePositionManager, ISwapRouter} from "@archliquid/core/interfaces/IUniswapV3.sol";
+import {IUniswapV4PositionManager, PoolKey} from "../../src/interfaces/IUniswapV4.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -90,13 +91,43 @@ contract MockAggregator {
     }
 }
 
-/// @dev Minimal combined V2 factory + router. Pairs are plain ERC20 LP
-///      tokens; swap outputs are preset by the test.
+contract MockV2Pair is ERC20 {
+    address public immutable factory;
+    address public immutable token0;
+    address public immutable token1;
+    uint112 private _reserve0;
+    uint112 private _reserve1;
+    uint32 private _blockTimestampLast;
+
+    constructor(address factory_, address token0_, address token1_) ERC20("Mock V2 LP", "mV2-LP") {
+        factory = factory_;
+        token0 = token0_;
+        token1 = token1_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function sync() external {
+        _reserve0 = uint112(IERC20(token0).balanceOf(address(this)));
+        _reserve1 = uint112(IERC20(token1).balanceOf(address(this)));
+        _blockTimestampLast = uint32(block.timestamp);
+    }
+
+    function getReserves() external view returns (uint112, uint112, uint32) {
+        return (_reserve0, _reserve1, _blockTimestampLast);
+    }
+}
+
+/// @dev Minimal combined V2 factory + router. Pairs expose the canonical V2
+///      identity surface; swap outputs are preset by the test.
 contract MockDex is IUniswapV2Factory, IUniswapV2Router02 {
     address private immutable _weth;
     MockERC20 public immutable stock;
 
     mapping(address => mapping(address => address)) private _pairs;
+    address[] public allPairs;
     uint256 public nextEthOut;
     uint256 public nextStockOut;
 
@@ -116,14 +147,26 @@ contract MockDex is IUniswapV2Factory, IUniswapV2Router02 {
         return _weth;
     }
 
+    function factory() external view returns (address) {
+        return address(this);
+    }
+
     function createPair(address tokenA, address tokenB) external returns (address pair) {
-        pair = address(new MockERC20("LP", "LP"));
+        require(tokenA != tokenB && tokenA != address(0) && tokenB != address(0), "mockdex: invalid pair");
+        require(_pairs[tokenA][tokenB] == address(0), "mockdex: pair exists");
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        pair = address(new MockV2Pair(address(this), token0, token1));
         _pairs[tokenA][tokenB] = pair;
         _pairs[tokenB][tokenA] = pair;
+        allPairs.push(pair);
     }
 
     function getPair(address tokenA, address tokenB) external view returns (address) {
         return _pairs[tokenA][tokenB];
+    }
+
+    function allPairsLength() external view returns (uint256) {
+        return allPairs.length;
     }
 
     function addLiquidityETH(address token, uint256 amountTokenDesired, uint256, uint256, address to, uint256)
@@ -133,10 +176,31 @@ contract MockDex is IUniswapV2Factory, IUniswapV2Router02 {
     {
         address pair = _pairs[token][_weth];
         require(pair != address(0), "mockdex: no pair");
-        IERC20(token).transferFrom(msg.sender, pair, amountTokenDesired);
+        require(IERC20(token).transferFrom(msg.sender, pair, amountTokenDesired), "mockdex: token transfer failed");
         uint256 liquidity = 1000e18;
-        MockERC20(pair).mint(to, liquidity);
+        MockV2Pair(pair).mint(to, liquidity);
         return (amountTokenDesired, msg.value, liquidity);
+    }
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
+        require(amountADesired >= amountAMin && amountBDesired >= amountBMin, "mockdex: liquidity slippage");
+        address pair = _pairs[tokenA][tokenB];
+        if (pair == address(0)) pair = this.createPair(tokenA, tokenB);
+        require(IERC20(tokenA).transferFrom(msg.sender, pair, amountADesired), "mockdex: tokenA transfer failed");
+        require(IERC20(tokenB).transferFrom(msg.sender, pair, amountBDesired), "mockdex: tokenB transfer failed");
+        MockV2Pair(pair).sync();
+        liquidity = 1000e18;
+        MockV2Pair(pair).mint(to, liquidity);
+        return (amountADesired, amountBDesired, liquidity);
     }
 
     function swapExactTokensForETHSupportingFeeOnTransferTokens(
@@ -149,9 +213,27 @@ contract MockDex is IUniswapV2Factory, IUniswapV2Router02 {
         require(nextEthOut >= amountOutMin, "mockdex: eth slippage");
         // real routers move sold tokens into the pair, not the router
         address pair = _pairs[path[0]][path[1]];
-        IERC20(path[0]).transferFrom(msg.sender, pair == address(0) ? address(this) : pair, amountIn);
+        require(
+            IERC20(path[0]).transferFrom(msg.sender, pair == address(0) ? address(this) : pair, amountIn),
+            "mockdex: token transfer failed"
+        );
         (bool ok,) = to.call{value: nextEthOut}("");
         require(ok, "mockdex: eth send failed");
+    }
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256
+    ) external {
+        require(path.length == 2, "mockdex: invalid path");
+        address pair = _pairs[path[0]][path[1]];
+        require(pair != address(0), "mockdex: no pair");
+        require(IERC20(path[0]).transferFrom(msg.sender, pair, amountIn), "mockdex: token transfer failed");
+        require(nextStockOut >= amountOutMin, "mockdex: stock slippage");
+        stock.mint(to, nextStockOut);
     }
 
     function swapExactETHForTokens(uint256 amountOutMin, address[] calldata, address to, uint256)
@@ -209,28 +291,31 @@ contract MockV3Pool {
 /// this local avoids pulling OpenZeppelin's Cancun-only Bytes utility into the
 /// testnet mock deployment, which must compile for Robinhood's Paris-era EVM.
 contract MockPositionNFT {
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
     mapping(uint256 => address) private _owners;
     mapping(uint256 => address) private _approvals;
 
-    function ownerOf(uint256 tokenId) public view returns (address owner) {
+    function ownerOf(uint256 tokenId) public view virtual returns (address owner) {
         owner = _owners[tokenId];
         require(owner != address(0), "nft: nonexistent token");
     }
 
-    function approve(address to, uint256 tokenId) external {
+    function approve(address to, uint256 tokenId) public virtual {
         require(msg.sender == ownerOf(tokenId), "nft: not owner");
         _approvals[tokenId] = to;
     }
 
-    function transferFrom(address from, address to, uint256 tokenId) public {
+    function transferFrom(address from, address to, uint256 tokenId) public virtual {
         require(ownerOf(tokenId) == from, "nft: wrong owner");
         require(msg.sender == from || msg.sender == _approvals[tokenId], "nft: not approved");
         require(to != address(0), "nft: zero recipient");
         _owners[tokenId] = to;
         delete _approvals[tokenId];
+        emit Transfer(from, to, tokenId);
     }
 
-    function safeTransferFrom(address from, address to, uint256 tokenId) external {
+    function safeTransferFrom(address from, address to, uint256 tokenId) public virtual {
         transferFrom(from, to, tokenId);
         if (to.code.length > 0) {
             require(
@@ -244,6 +329,7 @@ contract MockPositionNFT {
     function _mint(address to, uint256 tokenId) internal {
         require(to != address(0) && _owners[tokenId] == address(0), "nft: invalid mint");
         _owners[tokenId] = to;
+        emit Transfer(address(0), to, tokenId);
     }
 }
 
@@ -291,8 +377,8 @@ contract MockNFPM is MockPositionNFT {
         address pool = poolOf[_key(p.token0, p.token1, p.fee)];
         require(pool != address(0), "nfpm: no pool");
         // pay the pool directly from the caller (V3 mint-callback semantics)
-        IERC20(p.token0).transferFrom(msg.sender, pool, p.amount0Desired);
-        IERC20(p.token1).transferFrom(msg.sender, pool, p.amount1Desired);
+        require(IERC20(p.token0).transferFrom(msg.sender, pool, p.amount0Desired), "nfpm: token0 transfer failed");
+        require(IERC20(p.token1).transferFrom(msg.sender, pool, p.amount1Desired), "nfpm: token1 transfer failed");
         tokenId = nextId++;
         _mint(p.recipient, tokenId);
         return (tokenId, 1e18, p.amount0Desired, p.amount1Desired);
@@ -300,6 +386,127 @@ contract MockNFPM is MockPositionNFT {
 
     function collect(INonfungiblePositionManager.CollectParams calldata) external payable returns (uint256, uint256) {
         return (0, 0);
+    }
+}
+
+/* ── Uniswap V4 mocks ─────────────────────────────────────────────── */
+
+contract MockV4PoolManager {}
+
+contract MockV4PositionManager is MockPositionNFT, IUniswapV4PositionManager {
+    address public immutable poolManager;
+    uint256 public nextTokenId = 1;
+    mapping(uint256 => address) public subscriber;
+
+    mapping(uint256 => PoolKey) private _poolKeys;
+    mapping(uint256 => uint128) private _liquidity;
+    mapping(uint256 => uint256) public fees0;
+    mapping(uint256 => uint256) public fees1;
+    bool public mutatePrincipalOnCollect;
+    bytes32 public lastHookDataHash;
+
+    constructor(address poolManager_) {
+        poolManager = poolManager_;
+    }
+
+    receive() external payable {}
+
+    function mintPosition(address to, PoolKey calldata key, uint128 liquidity, address subscriber_)
+        external
+        returns (uint256 tokenId)
+    {
+        tokenId = nextTokenId++;
+        _poolKeys[tokenId] = key;
+        _liquidity[tokenId] = liquidity;
+        subscriber[tokenId] = subscriber_;
+        _mint(to, tokenId);
+    }
+
+    function setFees(uint256 tokenId, uint256 amount0, uint256 amount1) external {
+        ownerOf(tokenId);
+        fees0[tokenId] = amount0;
+        fees1[tokenId] = amount1;
+    }
+
+    function setMutatePrincipalOnCollect(bool value) external {
+        mutatePrincipalOnCollect = value;
+    }
+
+    function ownerOf(uint256 tokenId)
+        public
+        view
+        override(MockPositionNFT, IUniswapV4PositionManager)
+        returns (address owner)
+    {
+        return super.ownerOf(tokenId);
+    }
+
+    function approve(address to, uint256 tokenId) public override(MockPositionNFT, IUniswapV4PositionManager) {
+        super.approve(to, tokenId);
+    }
+
+    function transferFrom(address from, address to, uint256 tokenId) public override {
+        super.transferFrom(from, to, tokenId);
+        delete subscriber[tokenId];
+    }
+
+    function safeTransferFrom(address from, address to, uint256 tokenId)
+        public
+        override(MockPositionNFT, IUniswapV4PositionManager)
+    {
+        super.safeTransferFrom(from, to, tokenId);
+    }
+
+    function getPositionLiquidity(uint256 tokenId) external view returns (uint128 liquidity) {
+        ownerOf(tokenId);
+        return _liquidity[tokenId];
+    }
+
+    function getPoolAndPositionInfo(uint256 tokenId)
+        external
+        view
+        returns (PoolKey memory poolKey, uint256 positionInfo)
+    {
+        ownerOf(tokenId);
+        return (_poolKeys[tokenId], 0);
+    }
+
+    function modifyLiquidities(bytes calldata unlockData, uint256 deadline) external payable {
+        require(deadline >= block.timestamp, "v4: expired");
+        (bytes memory actions, bytes[] memory params) = abi.decode(unlockData, (bytes, bytes[]));
+        require(
+            actions.length == 2 && uint8(actions[0]) == 0x01 && uint8(actions[1]) == 0x11 && params.length == 2,
+            "v4: wrong actions"
+        );
+
+        (uint256 tokenId, uint256 liquidityToRemove, uint128 amount0Min, uint128 amount1Min, bytes memory hookData) =
+            abi.decode(params[0], (uint256, uint256, uint128, uint128, bytes));
+        require(ownerOf(tokenId) == msg.sender, "v4: not owner");
+        require(liquidityToRemove == 0 && amount0Min == 0 && amount1Min == 0, "v4: principal requested");
+
+        (address currency0, address currency1, address recipient) = abi.decode(params[1], (address, address, address));
+        PoolKey memory key = _poolKeys[tokenId];
+        require(currency0 == key.currency0 && currency1 == key.currency1, "v4: wrong currencies");
+        lastHookDataHash = keccak256(hookData);
+
+        if (mutatePrincipalOnCollect) _liquidity[tokenId] -= 1;
+
+        uint256 amount0 = fees0[tokenId];
+        uint256 amount1 = fees1[tokenId];
+        delete fees0[tokenId];
+        delete fees1[tokenId];
+        _pay(currency0, recipient, amount0);
+        _pay(currency1, recipient, amount1);
+    }
+
+    function _pay(address currency, address recipient, uint256 amount) private {
+        if (amount == 0) return;
+        if (currency == address(0)) {
+            (bool ok,) = recipient.call{value: amount}("");
+            require(ok, "v4: native transfer failed");
+        } else {
+            require(IERC20(currency).transfer(recipient, amount), "v4: token transfer failed");
+        }
     }
 }
 
@@ -332,7 +539,7 @@ contract MockV3Router {
             address pool = nfpm.poolOf(keccak256(abi.encode(a, b, p.fee)));
             if (pool != address(0)) dest = pool;
         }
-        IERC20(p.tokenIn).transferFrom(msg.sender, dest, p.amountIn);
+        require(IERC20(p.tokenIn).transferFrom(msg.sender, dest, p.amountIn), "router: input transfer failed");
         amountOut = nextOut[p.tokenOut];
         require(amountOut >= p.amountOutMinimum, "router: slippage");
         MockERC20(p.tokenOut).mint(p.recipient, amountOut);
