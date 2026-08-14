@@ -121,6 +121,32 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
     function seed(SeedParams calldata p) external nonReentrant returns (SeedResult memory result) {
         require(_isAuthorized(msg.sender), "v4 adapter: unauthorized");
+        return _seed(p, true, 0, 0);
+    }
+
+    /// @notice Adds a full-range position to this adapter's fixed hookless V4
+    ///         pool. A first pool must initialize at the exact ratio supplied;
+    ///         an existing pool must remain inside the provider's explicit
+    ///         execution-time price corridor.
+    /// @dev Only the immutable, pre-launch-bound provisioner may use this path.
+    function seedUserLiquidity(
+        SeedParams calldata p,
+        bool createsFirstMarket,
+        uint160 minimumSqrtPriceX96,
+        uint160 maximumSqrtPriceX96
+    ) external nonReentrant returns (SeedResult memory result) {
+        require(msg.sender == liquidityProvisioner && launchersBound, "v4 adapter: unauthorized provisioner");
+        require(minimumSqrtPriceX96 > 0, "v4 adapter: zero minimum price");
+        require(minimumSqrtPriceX96 <= maximumSqrtPriceX96, "v4 adapter: invalid price bounds");
+        return _seed(p, createsFirstMarket, minimumSqrtPriceX96, maximumSqrtPriceX96);
+    }
+
+    function _seed(
+        SeedParams calldata p,
+        bool requireExactPrice,
+        uint160 minimumSqrtPriceX96,
+        uint160 maximumSqrtPriceX96
+    ) private returns (SeedResult memory result) {
         require(p.token != address(0) && p.token != address(WETH), "v4 adapter: invalid token");
         require(p.tokenAmount > 0 && p.wethAmount > 0, "v4 adapter: zero seed");
         require(p.tokenAmount <= type(uint128).max && p.wethAmount <= type(uint128).max, "v4 adapter: seed too large");
@@ -138,16 +164,32 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
         require(WETH.balanceOf(address(this)) == wethBefore + p.wethAmount, "v4 adapter: weth input mismatch");
 
         (PoolKey memory key, uint256 amount0, uint256 amount1) = _poolKeyAndAmounts(p);
-        uint160 sqrtPriceX96 = UniV3.sqrtPriceX96(amount0, amount1);
+        uint160 intendedSqrtPriceX96 = UniV3.sqrtPriceX96(amount0, amount1);
         bytes32 poolId = keccak256(abi.encode(key));
 
-        // initialize() reverts when a pool already exists. Existing pools are
-        // accepted only when StateView proves the exact intended seed price.
-        try POOL_MANAGER.initialize(key, sqrtPriceX96) {} catch {}
+        // initialize() reverts when a pool already exists. A launcher or a
+        // deferred first user market must prove the exact intended seed price.
+        // Existing markets instead use the actual pool price, bounded by the
+        // provider to prevent execution after an adverse price movement.
+        try POOL_MANAGER.initialize(key, intendedSqrtPriceX96) {} catch {}
         (uint160 actualSqrt,,,) = STATE_VIEW.getSlot0(poolId);
-        require(actualSqrt == sqrtPriceX96, "v4 adapter: hostile pool price");
+        if (requireExactPrice) {
+            require(actualSqrt == intendedSqrtPriceX96, "v4 adapter: hostile pool price");
+            if (minimumSqrtPriceX96 > 0) {
+                require(
+                    actualSqrt >= minimumSqrtPriceX96 && actualSqrt <= maximumSqrtPriceX96,
+                    "v4 adapter: price outside bounds"
+                );
+            }
+        } else {
+            require(
+                actualSqrt >= minimumSqrtPriceX96 && actualSqrt <= maximumSqrtPriceX96,
+                "v4 adapter: price outside bounds"
+            );
+        }
+        require(actualSqrt > SQRT_LOWER_X96 && actualSqrt < SQRT_UPPER_X96, "v4 adapter: price outside full range");
 
-        uint128 liquidity = _liquidityForAmounts(sqrtPriceX96, amount0, amount1);
+        uint128 liquidity = _liquidityForAmounts(actualSqrt, amount0, amount1);
         require(liquidity > 0, "v4 adapter: zero liquidity");
         uint256 tokenId = POSITION_MANAGER.nextTokenId();
         address positionOwner = p.permanent ? DEAD : address(this);

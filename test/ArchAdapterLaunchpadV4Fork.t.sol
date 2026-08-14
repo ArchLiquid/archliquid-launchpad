@@ -8,22 +8,24 @@ import {ArchAdapterPresale} from "../src/ArchAdapterPresale.sol";
 import {ArchAdapterBondingCurve} from "../src/ArchAdapterBondingCurve.sol";
 import {ArchAdapterPresaleDeployer} from "../src/ArchAdapterPresaleDeployer.sol";
 import {ArchAdapterCurveDeployer} from "../src/ArchAdapterCurveDeployer.sol";
+import {ArchAdapterTokenFactory} from "../src/ArchAdapterTokenFactory.sol";
 import {ArchV4PositionLocker} from "@archliquid/lockers/ArchV4PositionLocker.sol";
 import {IUniswapV4PositionManager as LockerV4PositionManager} from "@archliquid/lockers/interfaces/IUniswapV4.sol";
 import {ArchV4LaunchLiquidityAdapter} from "../src/ArchV4LaunchLiquidityAdapter.sol";
-import {ArchUserLiquidityProvisioner} from "../src/ArchUserLiquidityProvisioner.sol";
+import {ArchV4UserLiquidityProvisioner} from "../src/ArchV4UserLiquidityProvisioner.sol";
 import {ArchV4SwapRouterAdapter} from "../src/ArchV4SwapRouterAdapter.sol";
 import {ArchV2SwapRouterAdapter} from "../src/ArchV2SwapRouterAdapter.sol";
 import {ArchStockRegistry} from "@archliquid/core/ArchStockRegistry.sol";
 import {ArchStockSwapExecutor} from "@archliquid/core/ArchStockSwapExecutor.sol";
 import {ArchToken} from "@archliquid/token/ArchToken.sol";
 import {ArchTreasury} from "@archliquid/core/ArchTreasury.sol";
-import {IArchLaunchRegistry} from "../src/interfaces/IArchLaunchLiquidityAdapter.sol";
+import {IArchLaunchLiquidityAdapter, IArchLaunchRegistry} from "../src/interfaces/IArchLaunchLiquidityAdapter.sol";
 import {
     IPermit2AllowanceTransfer,
     IUniswapV4PoolManager,
     IUniswapV4PositionManager,
-    IUniswapV4StateView
+    IUniswapV4StateView,
+    PoolKey
 } from "../src/interfaces/IUniswapV4.sol";
 import {IUniswapV2Factory, IUniswapV2Router02} from "../src/interfaces/IUniswapV2.sol";
 import {ISwapRouter, IWETH9} from "@archliquid/core/interfaces/IUniswapV3.sol";
@@ -47,8 +49,10 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
     MockERC20 private stock;
     ArchV4PositionLocker private locker;
     ArchV4LaunchLiquidityAdapter private liquidityAdapter;
+    ArchV4UserLiquidityProvisioner private provisioner;
     ArchV4SwapRouterAdapter private swapAdapter;
     ArchAdapterLaunchpad private launchpad;
+    ArchAdapterTokenFactory private tokenFactory;
 
     address private keeper = makeAddr("keeper");
     address private creator = makeAddr("creator");
@@ -93,7 +97,7 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         liquidityAdapter = new ArchV4LaunchLiquidityAdapter(
             POSITION_MANAGER, STATE_VIEW, PERMIT2, IERC20(address(weth)), locker, address(this)
         );
-        ArchUserLiquidityProvisioner provisioner = new ArchUserLiquidityProvisioner(liquidityAdapter);
+        provisioner = new ArchV4UserLiquidityProvisioner(liquidityAdapter);
         ArchAdapterPresaleDeployer presaleDeployer = new ArchAdapterPresaleDeployer();
         ArchAdapterCurveDeployer curveDeployer = new ArchAdapterCurveDeployer();
         launchpad = new ArchAdapterLaunchpad(
@@ -109,10 +113,21 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
             presaleDeployer,
             curveDeployer
         );
+        tokenFactory = new ArchAdapterTokenFactory(
+            0,
+            payable(address(treasury)),
+            keeper,
+            liquidityAdapter,
+            ISwapRouter(address(swapAdapter)),
+            IWETH9(address(weth)),
+            V4_FEE,
+            0,
+            registry
+        );
         presaleDeployer.setLaunchpad(address(launchpad));
         curveDeployer.setLaunchpad(address(launchpad));
         liquidityAdapter.bindLiquidityProvisioner(address(provisioner));
-        liquidityAdapter.bindLaunchers(address(0), IArchLaunchRegistry(address(launchpad)));
+        liquidityAdapter.bindLaunchers(address(tokenFactory), IArchLaunchRegistry(address(launchpad)));
         locker.setFeeExempt(address(liquidityAdapter), true);
 
         stock.mint(address(this), 2_000_000e18);
@@ -198,6 +213,128 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         vm.prank(alice);
         token.claim();
         assertEq(stock.balanceOf(alice) - aliceStockBefore, aliceClaimable);
+    }
+
+    function test_userLiquidityCreatesFirstPoolThenAddsBoundedLockedAndPermanentPositions() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V4 User Liquidity",
+            symbol: "V4UL",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory noInitialLiquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: false, lpPct: 0, poolFee: 0, burnLp: false, lockDuration: 0
+        });
+
+        vm.prank(alice);
+        ArchToken token = ArchToken(payable(tokenFactory.createToken(tokenParams, noInitialLiquidity)));
+        assertTrue(token.wired());
+        assertEq(token.marketPairCount(), 0);
+        assertEq(token.liquidityProvisioner(), address(provisioner));
+
+        uint256 tokenAmount = 10_000e18;
+        uint256 ethAmount = 0.05 ether;
+        vm.startPrank(alice);
+        token.approve(address(provisioner), tokenAmount * 4);
+        IArchLaunchLiquidityAdapter.SeedResult memory first = provisioner.addLiquidity{value: ethAmount}(
+            token, tokenAmount, address(0), 1, type(uint160).max, 30 days, false
+        );
+        vm.stopPrank();
+
+        address poolManager = POSITION_MANAGER.poolManager();
+        assertEq(first.market, poolManager);
+        assertTrue(token.isMarketPair(poolManager));
+        assertEq(token.marketPairCount(), 1);
+        assertEq(POSITION_MANAGER.ownerOf(first.positionIdOrAmount), address(locker));
+        ArchV4PositionLocker.Lock memory firstLock = locker.getLock(first.lockId);
+        assertEq(firstLock.owner, alice);
+        assertEq(firstLock.tokenId, first.positionIdOrAmount);
+
+        (uint160 currentSqrt,,,) = STATE_VIEW.getSlot0(first.poolId);
+        vm.prank(alice);
+        IArchLaunchLiquidityAdapter.SeedResult memory second = provisioner.addLiquidity{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 45 days, false
+        );
+        assertEq(second.poolId, first.poolId);
+        assertEq(POSITION_MANAGER.ownerOf(second.positionIdOrAmount), address(locker));
+        ArchV4PositionLocker.Lock memory secondLock = locker.getLock(second.lockId);
+        assertEq(secondLock.owner, alice);
+        assertEq(secondLock.tokenId, second.positionIdOrAmount);
+
+        vm.expectRevert("v4 adapter: price outside bounds");
+        vm.prank(alice);
+        provisioner.addLiquidity{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt + 1, currentSqrt + 2, 30 days, false
+        );
+
+        ArchV4UserLiquidityProvisioner wrongGeneration = new ArchV4UserLiquidityProvisioner(liquidityAdapter);
+        vm.expectRevert("v4 provisioner: wrong generation");
+        vm.prank(alice);
+        wrongGeneration.addLiquidity{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 30 days, false
+        );
+
+        vm.prank(alice);
+        IArchLaunchLiquidityAdapter.SeedResult memory permanent = provisioner.addLiquidity{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 0, true
+        );
+        assertEq(POSITION_MANAGER.ownerOf(permanent.positionIdOrAmount), DEAD);
+        assertEq(permanent.lockId, type(uint256).max);
+
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+        assertEq(token.balanceOf(address(liquidityAdapter)), 0);
+        assertEq(weth.balanceOf(address(liquidityAdapter)), 0);
+        assertEq(token.allowance(address(provisioner), address(liquidityAdapter)), 0);
+        assertEq(weth.allowance(address(provisioner), address(liquidityAdapter)), 0);
+        assertEq(token.allowance(address(liquidityAdapter), address(PERMIT2)), 0);
+        assertEq(weth.allowance(address(liquidityAdapter), address(PERMIT2)), 0);
+    }
+
+    function test_deferredFirstPoolRejectsHostilePreinitializationAtomically() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V4 Hostile Pool",
+            symbol: "V4HP",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory noInitialLiquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: false, lpPct: 0, poolFee: 0, burnLp: false, lockDuration: 0
+        });
+        vm.prank(alice);
+        ArchToken token = ArchToken(payable(tokenFactory.createToken(tokenParams, noInitialLiquidity)));
+
+        bool tokenIs0 = address(token) < address(weth);
+        PoolKey memory key = PoolKey({
+            currency0: tokenIs0 ? address(token) : address(weth),
+            currency1: tokenIs0 ? address(weth) : address(token),
+            fee: V4_FEE,
+            tickSpacing: 60,
+            hooks: address(0)
+        });
+        IUniswapV4PoolManager(POSITION_MANAGER.poolManager()).initialize(key, uint160(1 << 96));
+
+        uint256 tokenAmount = 10_000e18;
+        uint256 ethAmount = 0.05 ether;
+        uint256 tokenBefore = token.balanceOf(alice);
+        uint256 ethBefore = alice.balance;
+        vm.prank(alice);
+        token.approve(address(provisioner), tokenAmount);
+        vm.expectRevert("v4 adapter: hostile pool price");
+        vm.prank(alice);
+        provisioner.addLiquidity{value: ethAmount}(token, tokenAmount, address(0), 1, type(uint160).max, 30 days, false);
+
+        assertEq(token.marketPairCount(), 0);
+        assertEq(token.balanceOf(alice), tokenBefore);
+        assertEq(alice.balance, ethBefore);
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+        assertEq(token.balanceOf(address(liquidityAdapter)), 0);
+        assertEq(weth.balanceOf(address(liquidityAdapter)), 0);
     }
 
     function test_curveGraduatesIntoPermanentLiveV4Position() public {

@@ -14,6 +14,7 @@ import {ArchV4LaunchLiquidityAdapter} from "../src/ArchV4LaunchLiquidityAdapter.
 import {ArchV2SwapRouterAdapter} from "../src/ArchV2SwapRouterAdapter.sol";
 import {ArchV4SwapRouterAdapter} from "../src/ArchV4SwapRouterAdapter.sol";
 import {ArchUserLiquidityProvisioner} from "../src/ArchUserLiquidityProvisioner.sol";
+import {ArchV4UserLiquidityProvisioner} from "../src/ArchV4UserLiquidityProvisioner.sol";
 import {ArchAdapterTokenFactory} from "../src/ArchAdapterTokenFactory.sol";
 import {ArchAdapterLaunchpad} from "../src/ArchAdapterLaunchpad.sol";
 import {ArchAdapterPresaleDeployer} from "../src/ArchAdapterPresaleDeployer.sol";
@@ -218,7 +219,7 @@ contract DeployAmmModules is Script {
         ArchV4LaunchLiquidityAdapter adapter = new ArchV4LaunchLiquidityAdapter(
             V4_POSITION_MANAGER, V4_STATE_VIEW, PERMIT2, IERC20(address(weth)), locker, governance
         );
-        ArchUserLiquidityProvisioner provisioner = new ArchUserLiquidityProvisioner(adapter);
+        ArchV4UserLiquidityProvisioner provisioner = new ArchV4UserLiquidityProvisioner(adapter);
         ArchV4SwapRouterAdapter swapRouter = new ArchV4SwapRouterAdapter(
             V4_POOL_MANAGER, IERC20(address(weth)), stock, ISwapRouter(address(stockRouter))
         );
