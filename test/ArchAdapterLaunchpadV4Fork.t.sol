@@ -11,6 +11,7 @@ import {ArchAdapterCurveDeployer} from "../src/ArchAdapterCurveDeployer.sol";
 import {ArchV4PositionLocker} from "@archliquid/lockers/ArchV4PositionLocker.sol";
 import {IUniswapV4PositionManager as LockerV4PositionManager} from "@archliquid/lockers/interfaces/IUniswapV4.sol";
 import {ArchV4LaunchLiquidityAdapter} from "../src/ArchV4LaunchLiquidityAdapter.sol";
+import {ArchUserLiquidityProvisioner} from "../src/ArchUserLiquidityProvisioner.sol";
 import {ArchV4SwapRouterAdapter} from "../src/ArchV4SwapRouterAdapter.sol";
 import {ArchV2SwapRouterAdapter} from "../src/ArchV2SwapRouterAdapter.sol";
 import {ArchStockRegistry} from "@archliquid/core/ArchStockRegistry.sol";
@@ -58,7 +59,7 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
 
     function setUp() public {
         liveFork = address(POSITION_MANAGER).code.length > 0;
-        if (!liveFork) return;
+        vm.skip(!liveFork, "requires Robinhood testnet V4 fork");
 
         vm.deal(address(this), 200 ether);
         vm.deal(creator, 20 ether);
@@ -92,6 +93,7 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         liquidityAdapter = new ArchV4LaunchLiquidityAdapter(
             POSITION_MANAGER, STATE_VIEW, PERMIT2, IERC20(address(weth)), locker, address(this)
         );
+        ArchUserLiquidityProvisioner provisioner = new ArchUserLiquidityProvisioner(liquidityAdapter);
         ArchAdapterPresaleDeployer presaleDeployer = new ArchAdapterPresaleDeployer();
         ArchAdapterCurveDeployer curveDeployer = new ArchAdapterCurveDeployer();
         launchpad = new ArchAdapterLaunchpad(
@@ -109,6 +111,7 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         );
         presaleDeployer.setLaunchpad(address(launchpad));
         curveDeployer.setLaunchpad(address(launchpad));
+        liquidityAdapter.bindLiquidityProvisioner(address(provisioner));
         liquidityAdapter.bindLaunchers(address(0), IArchLaunchRegistry(address(launchpad)));
         locker.setFeeExempt(address(liquidityAdapter), true);
 
@@ -125,8 +128,6 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
     }
 
     function test_presaleFinalizesLocksAndTradesThroughLiveV4Stack() public {
-        if (!liveFork) return;
-
         ArchAdapterPresale.TokenConfig memory tokenConfig = ArchAdapterPresale.TokenConfig({
             name: "V4 Presale",
             symbol: "V4P",
@@ -200,8 +201,6 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
     }
 
     function test_curveGraduatesIntoPermanentLiveV4Position() public {
-        if (!liveFork) return;
-
         ArchAdapterBondingCurve.TokenConfig memory tokenConfig = ArchAdapterBondingCurve.TokenConfig({
             name: "V4 Curve",
             symbol: "V4C",

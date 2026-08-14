@@ -13,6 +13,7 @@ import {ArchV2LaunchLiquidityAdapter} from "../src/ArchV2LaunchLiquidityAdapter.
 import {ArchV4LaunchLiquidityAdapter} from "../src/ArchV4LaunchLiquidityAdapter.sol";
 import {ArchV2SwapRouterAdapter} from "../src/ArchV2SwapRouterAdapter.sol";
 import {ArchV4SwapRouterAdapter} from "../src/ArchV4SwapRouterAdapter.sol";
+import {ArchUserLiquidityProvisioner} from "../src/ArchUserLiquidityProvisioner.sol";
 import {ArchAdapterTokenFactory} from "../src/ArchAdapterTokenFactory.sol";
 import {ArchAdapterLaunchpad} from "../src/ArchAdapterLaunchpad.sol";
 import {ArchAdapterPresaleDeployer} from "../src/ArchAdapterPresaleDeployer.sol";
@@ -59,6 +60,7 @@ contract DeployAmmModules is Script {
     struct FamilyDeployment {
         address locker;
         address liquidityAdapter;
+        address liquidityProvisioner;
         address swapRouter;
         address tokenFactory;
         address presaleDeployer;
@@ -162,6 +164,7 @@ contract DeployAmmModules is Script {
             lockerFee, treasury, LockerV2Factory(address(v2Factory)), governance
         );
         ArchV2LaunchLiquidityAdapter adapter = new ArchV2LaunchLiquidityAdapter(v2Router, locker, governance);
+        ArchUserLiquidityProvisioner provisioner = new ArchUserLiquidityProvisioner(adapter);
         ArchAdapterTokenFactory factory = new ArchAdapterTokenFactory(
             factoryFee, treasury, governance, adapter, ISwapRouter(address(swapRouter)), weth, 0, 0, registry
         );
@@ -182,12 +185,14 @@ contract DeployAmmModules is Script {
         );
         presaleDeployer.setLaunchpad(address(launchpad));
         curveDeployer.setLaunchpad(address(launchpad));
+        adapter.bindLiquidityProvisioner(address(provisioner));
         adapter.bindLaunchers(address(factory), IArchLaunchRegistry(address(launchpad)));
         locker.setFeeExempt(address(adapter), true);
 
         deployed = FamilyDeployment({
             locker: address(locker),
             liquidityAdapter: address(adapter),
+            liquidityProvisioner: address(provisioner),
             swapRouter: address(swapRouter),
             tokenFactory: address(factory),
             presaleDeployer: address(presaleDeployer),
@@ -213,6 +218,7 @@ contract DeployAmmModules is Script {
         ArchV4LaunchLiquidityAdapter adapter = new ArchV4LaunchLiquidityAdapter(
             V4_POSITION_MANAGER, V4_STATE_VIEW, PERMIT2, IERC20(address(weth)), locker, governance
         );
+        ArchUserLiquidityProvisioner provisioner = new ArchUserLiquidityProvisioner(adapter);
         ArchV4SwapRouterAdapter swapRouter = new ArchV4SwapRouterAdapter(
             V4_POOL_MANAGER, IERC20(address(weth)), stock, ISwapRouter(address(stockRouter))
         );
@@ -236,12 +242,14 @@ contract DeployAmmModules is Script {
         );
         presaleDeployer.setLaunchpad(address(launchpad));
         curveDeployer.setLaunchpad(address(launchpad));
+        adapter.bindLiquidityProvisioner(address(provisioner));
         adapter.bindLaunchers(address(factory), IArchLaunchRegistry(address(launchpad)));
         locker.setFeeExempt(address(adapter), true);
 
         deployed = FamilyDeployment({
             locker: address(locker),
             liquidityAdapter: address(adapter),
+            liquidityProvisioner: address(provisioner),
             swapRouter: address(swapRouter),
             tokenFactory: address(factory),
             presaleDeployer: address(presaleDeployer),
@@ -269,6 +277,7 @@ contract DeployAmmModules is Script {
     function _logFamily(string memory name, FamilyDeployment memory deployed) private pure {
         console2.log(string.concat(name, " Locker"), deployed.locker);
         console2.log(string.concat(name, " LiquidityAdapter"), deployed.liquidityAdapter);
+        console2.log(string.concat(name, " LiquidityProvisioner"), deployed.liquidityProvisioner);
         console2.log(string.concat(name, " SwapRouter"), deployed.swapRouter);
         console2.log(string.concat(name, " TokenFactory"), deployed.tokenFactory);
         console2.log(string.concat(name, " PresaleDeployer"), deployed.presaleDeployer);

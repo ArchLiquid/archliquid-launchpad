@@ -44,9 +44,11 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
     address public tokenFactory;
     IArchLaunchRegistry public launchpad;
+    address public liquidityProvisioner;
     bool public launchersBound;
 
     event LaunchersBound(address indexed tokenFactory, address indexed launchpad);
+    event LiquidityProvisionerBound(address indexed provisioner);
     event LiquiditySeeded(
         address indexed caller,
         address indexed token,
@@ -93,6 +95,14 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
         require(tokenAmount <= type(uint128).max && wethAmount <= type(uint128).max, "v4 adapter: seed too large");
         UniV3.sqrtPriceX96(tokenAmount, wethAmount);
         UniV3.sqrtPriceX96(wethAmount, tokenAmount);
+    }
+
+    function bindLiquidityProvisioner(address provisioner) external onlyOwner {
+        require(!launchersBound, "v4 adapter: launchers bound");
+        require(liquidityProvisioner == address(0), "v4 adapter: provisioner set");
+        require(provisioner.code.length > 0, "v4 adapter: invalid provisioner");
+        liquidityProvisioner = provisioner;
+        emit LiquidityProvisionerBound(provisioner);
     }
 
     function bindLaunchers(address tokenFactory_, IArchLaunchRegistry launchpad_) external onlyOwner {
@@ -230,6 +240,7 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
     function _isAuthorized(address caller) private view returns (bool) {
         if (!launchersBound) return false;
+        if (caller == liquidityProvisioner) return true;
         if (caller == tokenFactory) return true;
         IArchLaunchRegistry registry = launchpad;
         return address(registry) != address(0) && registry.isLaunch(caller);

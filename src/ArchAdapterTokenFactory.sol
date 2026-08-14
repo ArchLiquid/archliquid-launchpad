@@ -156,6 +156,8 @@ contract ArchAdapterTokenFactory is ReentrancyGuard {
         );
         tokenAddr = address(token);
 
+        token.setTaxExempt(address(LIQUIDITY_ADAPTER));
+        token.setLiquidityProvisioner(LIQUIDITY_ADAPTER.liquidityProvisioner());
         token.setDividendExempt(address(this));
         token.setDividendExempt(tokenAddr);
         token.setDividendExempt(DEAD);

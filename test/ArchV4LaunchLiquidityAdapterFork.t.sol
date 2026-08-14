@@ -32,7 +32,7 @@ contract ArchV4LaunchLiquidityAdapterForkTest is Test {
         IPermit2AllowanceTransfer(0x000000000022D473030F116dDEE9F6B43aC78BA3);
 
     modifier liveV4Fork() {
-        if (address(POSITION_MANAGER).code.length == 0) return;
+        vm.skip(address(POSITION_MANAGER).code.length == 0, "requires Robinhood testnet V4 fork");
         _;
     }
 
