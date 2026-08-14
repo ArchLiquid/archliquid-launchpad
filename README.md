@@ -18,6 +18,7 @@ locked Uniswap V2, V3, or V4 liquidity on Robinhood Chain.
 | [`ArchAdapterBondingCurve`](src/ArchAdapterBondingCurve.sol) | AMM-neutral curve that graduates through its pinned adapter. |
 | [`ArchV2LaunchLiquidityAdapter`](src/ArchV2LaunchLiquidityAdapter.sol) | Seeds an exact-ratio canonical V2 pair and locks or permanently sends its LP tokens. |
 | [`ArchV4LaunchLiquidityAdapter`](src/ArchV4LaunchLiquidityAdapter.sol) | Seeds a hookless, static-fee, full-range V4 position and locks or permanently sends its position NFT. |
+| [`ArchUserLiquidityProvisioner`](src/ArchUserLiquidityProvisioner.sol) | Adds post-deployment liquidity through one immutable family adapter without accepting a user-selected market, router, spender, or recipient. |
 | [`ArchV2SwapRouterAdapter`](src/ArchV2SwapRouterAdapter.sol) | Presents canonical V2 routing through the launch token's router boundary. |
 | [`ArchV4SwapRouterAdapter`](src/ArchV4SwapRouterAdapter.sol) | Routes launch-token swaps through V4 and stock-token distribution through the configured V2 stock route. |
 | [`ArchPresaleDeployer`](src/ArchPresaleDeployer.sol) | Restricts presale deployment to its configured launchpad. |
@@ -51,15 +52,17 @@ registry, and child deployers.
 
 ## Robinhood Chain testnet release
 
-Release `robinhood-testnet-amm-2026-08-04-r1` is active on chain ID `46630`.
+The original V2/V4 release and the additive V2 user-liquidity release
+`robinhood-testnet-user-liquidity-2026-08-14-r1` are active on chain ID `46630`.
 The V2 fixture is included because the official Robinhood V2 addresses have no
 runtime code on testnet. The V4 family uses the live Robinhood testnet V4 stack.
 
 | Component | V2 | V4 |
 |---|---|---|
-| Launchpad | `0x911106D9c52b854bFF327446180C95f552e72cCd` | `0x94eEec9B20cDE4C58E7F982A863e913977AD73Ed` |
-| Token factory | `0x692Ae18590AdEbd3Fd1A0daBa6F7dB44F772b8bd` | `0xFf575Bc8DFE5Dd34c17814f71D091F1692e531AF` |
-| Liquidity adapter | `0x975f6C3cDb10C47456646E7e5e67F06316561D55` | `0x014e5142D5A6945930832506A5A99030F2B68A16` |
+| Launchpad | `0x3FD6651939A2138A5ecD4E17ba741e3ee0D6dfa6` | `0x94eEec9B20cDE4C58E7F982A863e913977AD73Ed` |
+| Token factory | `0xCB5756CAC20427a3d6536A7A55CC72B44dA9C1A7` | `0xFf575Bc8DFE5Dd34c17814f71D091F1692e531AF` |
+| Liquidity adapter | `0x050F2cF78d3D33e73777Db3BF0A6B476DB668A66` | `0x014e5142D5A6945930832506A5A99030F2B68A16` |
+| User-liquidity provisioner | `0xad16a8806EdF001c053A856bD625cbd720335CeA` | Not promoted |
 | Swap adapter | `0xb8525F9F98480d0A0f54A834f0A8d407D8CED3F2` | `0xa4C298f17d051634f59Dd37FEE05D4892a8153Ea` |
 | Locker | `0xb92D2c218bBb51C0F21fc12a6141596EafD98Def` | `0x8A1bC51e25b8799a5da57ff55f0262A405Ed2b98` |
 | Upstream factory or manager | `0x3d51588C41586Bc391A989156fBE6a7ceEd51446` | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
@@ -82,8 +85,9 @@ rules of the selected AMM:
 - V4 allows only hookless pools with a fixed 0.30% fee and tick spacing 60. It
   verifies the exact intended starting price through `StateView`, mints a
   full-range position through `PositionManager`, and leaves no adapter residue.
-- The adapter authorizes only its once-bound token factory and child contracts
-  recorded by its once-bound launchpad. Users cannot call `seed` directly.
+- The adapter authorizes only its once-bound token factory, child contracts
+  recorded by its once-bound launchpad, and one once-bound provisioner. Users
+  cannot call `seed` directly or substitute a router, market, or recipient.
 
 The common boundary is intentionally small:
 
@@ -100,11 +104,18 @@ IArchLaunchLiquidityAdapter.SeedResult memory result =
         })
     );
 
-token.setLiquidityPool(result.market, true);
+token.addMarketPair(result.market);
 ```
 
 `permanent: true` is used for bonding-curve graduation. It sends the V2 LP
 tokens or V4 position directly to `0x000000000000000000000000000000000000dEaD`.
+
+For an already-wired token, users call the bound provisioner instead of the
+adapter. A token with no market supplies `address(0)` as `expectedMarket`; the
+provisioner registers only that deferred first canonical market. Existing
+markets must already be registered by the token. Every resulting position is
+locked to `msg.sender` or permanently burned, and unused token/WETH inputs are
+refunded atomically.
 
 ## Install and build
 
@@ -260,11 +271,11 @@ complete V4 family without mutating the V3 release.
 
 Each family is wired in this order:
 
-1. Deploy the canonical locker, liquidity adapter, swap adapter, token factory,
-   child deployers, and launchpad.
+1. Deploy the canonical locker, liquidity adapter, liquidity provisioner, swap
+   adapter, token factory, child deployers, and launchpad.
 2. Bind each child deployer to its launchpad exactly once.
-3. Bind the liquidity adapter to the token factory and launch registry exactly
-   once.
+3. Bind the liquidity adapter to the provisioner, token factory, and launch
+   registry exactly once.
 4. Exempt only the adapter from the locker fee required for launch-created
    positions.
 5. Verify owner, immutable dependency, factory authorization, canonical AMM,
@@ -280,7 +291,7 @@ licenses.
 |---|---|
 | ArchLiquid Core | `b1f0bec05bdee32cdcb3dfa74310f2f5476760be` |
 | ArchLiquid Lockers | `f47efd092c263d1d185a777079413119b546b4ac` |
-| ArchLiquid Token | `b5cd8124c39a2e46bee19f74ea8f735178a0276b` |
+| ArchLiquid Token | `e2413e9e1fdc86d93cf4544b2e7fa6adcd9976f1` |
 | Foundry standard library | `c179529c064588ede54a0661ec3cc98219460d07` |
 | OpenZeppelin Contracts | `5fd1781b1454fd1ef8e722282f86f9293cacf256` |
 
@@ -290,8 +301,9 @@ The suites cover caps and windows, approved-stock enforcement, contribution and
 refund accounting, finalization atomicity, hostile pool initialization, exact
 V2 seeding, canonical-pair checks, V4 hook and fee policy, V4 Permit2 custody,
 LP and position locking, team vesting, curve solvency, tax-aware swaps,
-distribution processing, graduation, permanent liquidity, and post-graduation
-behavior.
+distribution processing, graduation, permanent liquidity, deferred first-pair
+registration, refund rollback, donation resistance, reentrancy, exact approvals,
+and post-graduation behavior.
 
 ```bash
 forge fmt --check

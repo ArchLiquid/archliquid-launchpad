@@ -225,6 +225,8 @@ contract ArchAdapterPresale is ReentrancyGuard {
             salt
         );
 
+        created.setTaxExempt(address(LIQUIDITY_ADAPTER));
+        created.setLiquidityProvisioner(LIQUIDITY_ADAPTER.liquidityProvisioner());
         created.setDividendExempt(address(this));
         created.setDividendExempt(address(created));
         created.setDividendExempt(DEAD);

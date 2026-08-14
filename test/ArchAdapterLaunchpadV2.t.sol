@@ -13,11 +13,12 @@ import {ArchLiquidityLocker} from "@archliquid/lockers/ArchLiquidityLocker.sol";
 import {IUniswapV2Factory as LockerV2Factory} from "@archliquid/lockers/interfaces/IUniswapV2.sol";
 import {ArchV2LaunchLiquidityAdapter} from "../src/ArchV2LaunchLiquidityAdapter.sol";
 import {ArchV2SwapRouterAdapter} from "../src/ArchV2SwapRouterAdapter.sol";
+import {ArchUserLiquidityProvisioner} from "../src/ArchUserLiquidityProvisioner.sol";
 import {ArchStockRegistry} from "@archliquid/core/ArchStockRegistry.sol";
 import {ArchStockSwapExecutor} from "@archliquid/core/ArchStockSwapExecutor.sol";
 import {ArchToken} from "@archliquid/token/ArchToken.sol";
 import {ArchTreasury} from "@archliquid/core/ArchTreasury.sol";
-import {IArchLaunchRegistry} from "../src/interfaces/IArchLaunchLiquidityAdapter.sol";
+import {IArchLaunchLiquidityAdapter, IArchLaunchRegistry} from "../src/interfaces/IArchLaunchLiquidityAdapter.sol";
 import {IUniswapV2Factory, IUniswapV2Pair, IUniswapV2Router02} from "../src/interfaces/IUniswapV2.sol";
 import {ISwapRouter, IWETH9} from "@archliquid/core/interfaces/IUniswapV3.sol";
 import {MockERC20, MockWETH} from "./mocks/Mocks.sol";
@@ -37,6 +38,7 @@ contract ArchAdapterLaunchpadV2Test is Test {
     ArchLiquidityLocker private locker;
     ArchV2LaunchLiquidityAdapter private liquidityAdapter;
     ArchV2SwapRouterAdapter private swapAdapter;
+    ArchUserLiquidityProvisioner private provisioner;
     ArchStockRegistry private registry;
     ArchAdapterTokenFactory private tokenFactory;
     ArchAdapterLaunchpad private launchpad;
@@ -64,6 +66,7 @@ contract ArchAdapterLaunchpadV2Test is Test {
         );
         liquidityAdapter = new ArchV2LaunchLiquidityAdapter(upstreamRouter, locker, address(this));
         swapAdapter = new ArchV2SwapRouterAdapter(v2Factory);
+        provisioner = new ArchUserLiquidityProvisioner(liquidityAdapter);
 
         registry = new ArchStockRegistry(address(this));
         registry.setApproved(address(stock), true);
@@ -98,6 +101,7 @@ contract ArchAdapterLaunchpadV2Test is Test {
         );
         presaleDeployer.setLaunchpad(address(launchpad));
         curveDeployer.setLaunchpad(address(launchpad));
+        liquidityAdapter.bindLiquidityProvisioner(address(provisioner));
         liquidityAdapter.bindLaunchers(address(tokenFactory), IArchLaunchRegistry(address(launchpad)));
         locker.setFeeExempt(address(liquidityAdapter), true);
 
@@ -131,6 +135,7 @@ contract ArchAdapterLaunchpadV2Test is Test {
         assertEq(presale.pair(), pair);
         assertTrue(locker.isCanonicalPair(pair));
         assertTrue(token.isMarketPair(pair));
+        assertTrue(token.isTaxExempt(address(liquidityAdapter)));
         assertTrue(token.wired());
 
         ArchLiquidityLocker.Lock memory created = locker.getLock(0);
@@ -236,8 +241,285 @@ contract ArchAdapterLaunchpadV2Test is Test {
             payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity));
         address pair = v2Factory.getPair(tokenAddress, address(weth));
         assertTrue(ArchToken(tokenAddress).isMarketPair(pair));
+        assertTrue(ArchToken(tokenAddress).isTaxExempt(address(liquidityAdapter)));
         assertGt(IERC20(pair).balanceOf(DEAD), 0);
         assertEq(ArchToken(tokenAddress).balanceOf(creator), SUPPLY / 2);
+    }
+
+    function test_userAddsExactRatioLiquidityWithoutTradeTaxAndReceivesLock() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Add Liquidity",
+            symbol: "V2AL",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address pair = v2Factory.getPair(address(token), address(weth));
+        uint256 tokenAmount = 50_000e18;
+        uint256 wethAmount = 0.2 ether;
+        uint256 taxBefore = token.balanceOf(address(token));
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), tokenAmount);
+        IArchLaunchLiquidityAdapter.SeedResult memory added =
+            provisioner.addLiquidity{value: wethAmount}(token, tokenAmount, pair, 180 days, false);
+        vm.stopPrank();
+
+        assertEq(added.market, pair);
+        assertEq(added.tokenUsed, tokenAmount);
+        assertEq(added.wethUsed, wethAmount);
+        assertEq(token.balanceOf(address(token)), taxBefore, "liquidity transfer must not accrue trade tax");
+        assertEq(token.allowance(address(provisioner), address(liquidityAdapter)), 0);
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+
+        ArchLiquidityLocker.Lock memory created = locker.getLock(added.lockId);
+        assertEq(created.token, pair);
+        assertEq(created.owner, creator);
+        assertEq(created.amount, added.positionIdOrAmount);
+        assertEq(created.unlockTime, uint64(block.timestamp) + 180 days);
+    }
+
+    function test_userProvisioningRejectsUnregisteredMarketBeforeMovingFunds() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Guarded Liquidity",
+            symbol: "V2GL",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address wrongMarket = address(stock);
+        uint256 creatorBefore = token.balanceOf(creator);
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 1e18);
+        vm.expectRevert("provisioner: unregistered market");
+        provisioner.addLiquidity{value: 1 ether}(token, 1e18, wrongMarket, 180 days, false);
+        vm.stopPrank();
+        assertEq(token.balanceOf(creator), creatorBefore);
+    }
+
+    function test_deferredFirstMarketRejectsNonzeroExpectationBeforeMovingFunds() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Deferred Guard",
+            symbol: "V2DG",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory noLiquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: false, lpPct: 0, poolFee: 0, burnLp: false, lockDuration: 0
+        });
+        vm.prank(creator);
+        ArchToken token = ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE}(tokenParams, noLiquidity)));
+        uint256 creatorBefore = token.balanceOf(creator);
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 100_000e18);
+        vm.expectRevert("provisioner: first market expectation");
+        provisioner.addLiquidity{value: 1 ether}(token, 100_000e18, address(stock), 180 days, false);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(creator), creatorBefore);
+        assertEq(token.marketPairCount(), 0);
+        assertEq(v2Factory.getPair(address(token), address(weth)), address(0));
+    }
+
+    function test_additionalLiquidityRejectsUnsafeLockModesAtomically() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Lock Guard",
+            symbol: "V2LG",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address pair = v2Factory.getPair(address(token), address(weth));
+        uint256 tokenBefore = token.balanceOf(creator);
+        uint256 ethBefore = creator.balance;
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 150_000e18);
+        vm.expectRevert("provisioner: zero duration");
+        provisioner.addLiquidity{value: 0.2 ether}(token, 50_000e18, pair, 0, false);
+        vm.expectRevert("v2 adapter: lock too short");
+        provisioner.addLiquidity{value: 0.2 ether}(token, 50_000e18, pair, 29 days, false);
+        vm.expectRevert("provisioner: permanent duration");
+        provisioner.addLiquidity{value: 0.2 ether}(token, 50_000e18, pair, 1, true);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(creator), tokenBefore);
+        assertEq(creator.balance, ethBefore);
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+    }
+
+    function test_userAdditionalLiquidityCanOnlyUseExactPoolRatio() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Ratio Guard",
+            symbol: "V2RG",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address pair = v2Factory.getPair(address(token), address(weth));
+        uint256 creatorTokenBefore = token.balanceOf(creator);
+        uint256 creatorEthBefore = creator.balance;
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 50_000e18);
+        vm.expectRevert("UniswapV2Router: INSUFFICIENT_B_AMOUNT");
+        provisioner.addLiquidity{value: 1 ether}(token, 50_000e18, pair, 180 days, false);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(creator), creatorTokenBefore);
+        assertEq(creator.balance, creatorEthBefore);
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+    }
+
+    function test_userCanMakeAdditionalLiquidityPermanent() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Permanent Add",
+            symbol: "V2PA",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address pair = v2Factory.getPair(address(token), address(weth));
+        uint256 burnedBefore = IERC20(pair).balanceOf(DEAD);
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 50_000e18);
+        IArchLaunchLiquidityAdapter.SeedResult memory added =
+            provisioner.addLiquidity{value: 0.2 ether}(token, 50_000e18, pair, 0, true);
+        vm.stopPrank();
+
+        assertEq(added.lockId, type(uint256).max);
+        assertEq(IERC20(pair).balanceOf(DEAD) - burnedBefore, added.positionIdOrAmount);
+        assertEq(token.balanceOf(address(token)), 0, "permanent liquidity must not be taxed as a trade");
+    }
+
+    function test_userCreatesDeferredFirstV2PairAndLocksLiquidity() public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Deferred Pair",
+            symbol: "V2DP",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory noLiquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: false, lpPct: 0, poolFee: 0, burnLp: false, lockDuration: 0
+        });
+
+        vm.prank(creator);
+        ArchToken token = ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE}(tokenParams, noLiquidity)));
+        assertEq(token.marketPairCount(), 0);
+        assertEq(v2Factory.getPair(address(token), address(weth)), address(0));
+        assertEq(token.liquidityProvisioner(), address(provisioner));
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), 100_000e18);
+        IArchLaunchLiquidityAdapter.SeedResult memory added =
+            provisioner.addLiquidity{value: 1 ether}(token, 100_000e18, address(0), 180 days, false);
+        vm.stopPrank();
+
+        address pair = v2Factory.getPair(address(token), address(weth));
+        assertEq(added.market, pair);
+        assertTrue(token.isMarketPair(pair));
+        assertEq(token.marketPairCount(), 1);
+        ArchLiquidityLocker.Lock memory created = locker.getLock(added.lockId);
+        assertEq(created.owner, creator);
+        assertEq(created.token, pair);
+        assertEq(IERC20(pair).balanceOf(address(locker)), added.positionIdOrAmount);
+    }
+
+    function test_liquidityProvisionerBindingIsImmutableAfterLaunchersFreeze() public {
+        assertEq(liquidityAdapter.liquidityProvisioner(), address(provisioner));
+
+        vm.expectRevert("v2 adapter: launchers bound");
+        liquidityAdapter.bindLiquidityProvisioner(address(stock));
+    }
+
+    function testFuzz_userExactRatioAdditionConservesFundsAndCreatesNonzeroLock(uint96 rawWethAmount) public {
+        ArchAdapterTokenFactory.TokenParams memory tokenParams = ArchAdapterTokenFactory.TokenParams({
+            name: "V2 Fuzz Liquidity",
+            symbol: "V2FL",
+            totalSupply: SUPPLY,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterTokenFactory.LiquidityParams memory liquidity = ArchAdapterTokenFactory.LiquidityParams({
+            enabled: true, lpPct: 50, poolFee: 0, burnLp: true, lockDuration: 0
+        });
+        vm.prank(creator);
+        ArchToken token =
+            ArchToken(payable(tokenFactory.createToken{value: FACTORY_FEE + 2 ether}(tokenParams, liquidity)));
+        address pair = v2Factory.getPair(address(token), address(weth));
+        uint256 wethAmount = bound(uint256(rawWethAmount), 1e12, 1 ether);
+        uint256 tokenAmount = wethAmount * 250_000;
+        uint256 creatorTokenBefore = token.balanceOf(creator);
+        uint256 creatorEthBefore = creator.balance;
+        uint256 taxBefore = token.balanceOf(address(token));
+
+        vm.startPrank(creator);
+        token.approve(address(provisioner), tokenAmount);
+        IArchLaunchLiquidityAdapter.SeedResult memory added =
+            provisioner.addLiquidity{value: wethAmount}(token, tokenAmount, pair, 180 days, false);
+        vm.stopPrank();
+
+        assertEq(added.tokenUsed, tokenAmount);
+        assertEq(added.wethUsed, wethAmount);
+        assertGt(added.positionIdOrAmount, 0);
+        assertEq(token.balanceOf(creator), creatorTokenBefore - tokenAmount);
+        assertEq(creator.balance, creatorEthBefore - wethAmount);
+        assertEq(token.balanceOf(address(token)), taxBefore);
+        assertEq(token.balanceOf(address(provisioner)), 0);
+        assertEq(weth.balanceOf(address(provisioner)), 0);
+        ArchLiquidityLocker.Lock memory created = locker.getLock(added.lockId);
+        assertEq(created.owner, creator);
+        assertEq(created.amount, added.positionIdOrAmount);
     }
 
     function _createPresale() private returns (ArchAdapterPresale) {

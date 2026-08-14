@@ -157,6 +157,8 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
             creator,
             bytes32(0)
         );
+        token.setTaxExempt(address(LIQUIDITY_ADAPTER));
+        token.setLiquidityProvisioner(LIQUIDITY_ADAPTER.liquidityProvisioner());
     }
 
     function quoteBuy(uint256 ethIn) public view returns (uint256 tokensOut, uint256 fee) {

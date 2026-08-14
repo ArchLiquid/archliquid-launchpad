@@ -31,6 +31,7 @@ interface IArchLaunchLiquidityAdapter {
     }
 
     function weth() external view returns (address);
+    function liquidityProvisioner() external view returns (address);
     function validateSeedAmounts(uint256 tokenAmount, uint256 wethAmount) external view;
     function seed(SeedParams calldata params) external returns (SeedResult memory result);
 }

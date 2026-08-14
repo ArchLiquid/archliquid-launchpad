@@ -26,9 +26,11 @@ contract ArchV2LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
     address public tokenFactory;
     IArchLaunchRegistry public launchpad;
+    address public liquidityProvisioner;
     bool public launchersBound;
 
     event LaunchersBound(address indexed tokenFactory, address indexed launchpad);
+    event LiquidityProvisionerBound(address indexed provisioner);
     event LiquiditySeeded(
         address indexed caller,
         address indexed token,
@@ -63,6 +65,18 @@ contract ArchV2LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
     function validateSeedAmounts(uint256 tokenAmount, uint256 wethAmount) external pure {
         require(tokenAmount > 0 && wethAmount > 0, "v2 adapter: zero seed");
         require(tokenAmount <= type(uint112).max && wethAmount <= type(uint112).max, "v2 adapter: reserve overflow");
+    }
+
+    /// @notice Binds the only permissionless user entry point before launcher
+    ///         wiring is frozen. The provisioner itself accepts only already-
+    ///         registered ArchToken/WETH markets and always locks or burns the
+    ///         resulting LP position.
+    function bindLiquidityProvisioner(address provisioner) external onlyOwner {
+        require(!launchersBound, "v2 adapter: launchers bound");
+        require(liquidityProvisioner == address(0), "v2 adapter: provisioner set");
+        require(provisioner.code.length > 0, "v2 adapter: invalid provisioner");
+        liquidityProvisioner = provisioner;
+        emit LiquidityProvisionerBound(provisioner);
     }
 
     /// @notice Irreversibly binds the protocol entry points. At least one must
@@ -138,6 +152,7 @@ contract ArchV2LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
     function _isAuthorized(address caller) private view returns (bool) {
         if (!launchersBound) return false;
+        if (caller == liquidityProvisioner) return true;
         if (caller == tokenFactory) return true;
         IArchLaunchRegistry registry = launchpad;
         return address(registry) != address(0) && registry.isLaunch(caller);
