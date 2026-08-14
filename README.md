@@ -19,6 +19,7 @@ locked Uniswap V2, V3, or V4 liquidity on Robinhood Chain.
 | [`ArchV2LaunchLiquidityAdapter`](src/ArchV2LaunchLiquidityAdapter.sol) | Seeds an exact-ratio canonical V2 pair and locks or permanently sends its LP tokens. |
 | [`ArchV4LaunchLiquidityAdapter`](src/ArchV4LaunchLiquidityAdapter.sol) | Seeds a hookless, static-fee, full-range V4 position and locks or permanently sends its position NFT. |
 | [`ArchUserLiquidityProvisioner`](src/ArchUserLiquidityProvisioner.sol) | Adds post-deployment liquidity through one immutable family adapter without accepting a user-selected market, router, spender, or recipient. |
+| [`ArchV4UserLiquidityProvisioner`](src/ArchV4UserLiquidityProvisioner.sol) | Adds V4 liquidity through the fixed hookless pool key with explicit execution-price bounds and locked-or-burned custody. |
 | [`ArchV2SwapRouterAdapter`](src/ArchV2SwapRouterAdapter.sol) | Presents canonical V2 routing through the launch token's router boundary. |
 | [`ArchV4SwapRouterAdapter`](src/ArchV4SwapRouterAdapter.sol) | Routes launch-token swaps through V4 and stock-token distribution through the configured V2 stock route. |
 | [`ArchPresaleDeployer`](src/ArchPresaleDeployer.sol) | Restricts presale deployment to its configured launchpad. |
@@ -85,6 +86,9 @@ rules of the selected AMM:
 - V4 allows only hookless pools with a fixed 0.30% fee and tick spacing 60. It
   verifies the exact intended starting price through `StateView`, mints a
   full-range position through `PositionManager`, and leaves no adapter residue.
+  Existing-pool additions use the live `StateView` price only when it remains
+  inside the provider's explicit square-root-price corridor; deferred first
+  pools must still initialize at the exact deposit-derived price.
 - The adapter authorizes only its once-bound token factory, child contracts
   recorded by its once-bound launchpad, and one once-bound provisioner. Users
   cannot call `seed` directly or substitute a router, market, or recipient.
