@@ -1,0 +1,36 @@
+name: Launchpad contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  foundry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Initialize pinned public modules
+        run: |
+          git submodule update --init \
+            lib/core lib/lockers lib/token \
+            lib/forge-std lib/openzeppelin-contracts
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Run launchpad tests
+        run: forge test -vv
+
+      - name: Enforce deployable sizes
+        run: forge build --sizes
