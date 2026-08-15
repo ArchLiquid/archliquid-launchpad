@@ -1,7 +1,7 @@
 # ArchLiquid Launchpad
 
 Fixed-price presales and constant-product bonding curves that graduate into
-locked Uniswap V2, V3, or V4 liquidity on Robinhood Chain.
+locked Uniswap V3 or V4 liquidity on Robinhood Chain.
 
 > **Status:** Live on Robinhood Chain testnet. Testnet assets have no monetary
 > value. Review the contract, network, and transaction details before signing.
@@ -13,14 +13,12 @@ locked Uniswap V2, V3, or V4 liquidity on Robinhood Chain.
 | [`ArchLaunchpad`](src/ArchLaunchpad.sol) | V3 launch factory for approved stock tokens, fixed listing fees, presales, and curves. |
 | [`ArchPresale`](src/ArchPresale.sol) | Escrows fixed-price contributions, handles refunds, seeds V3 liquidity, locks the position, and vests the team allocation. |
 | [`ArchBondingCurve`](src/ArchBondingCurve.sol) | Buys and sells against virtual reserves, then graduates the remaining inventory into V3 liquidity. |
-| [`ArchAdapterLaunchpad`](src/ArchAdapterLaunchpad.sol) | Versioned V2/V4 launch factory bound to one liquidity adapter and one tax-aware swap route. |
+| [`ArchAdapterLaunchpad`](src/ArchAdapterLaunchpad.sol) | V4 launch factory bound to one liquidity adapter and one tax-aware swap route. |
 | [`ArchAdapterPresale`](src/ArchAdapterPresale.sol) | AMM-neutral presale that delegates pool creation and custody to its pinned adapter. |
 | [`ArchAdapterBondingCurve`](src/ArchAdapterBondingCurve.sol) | AMM-neutral curve that graduates through its pinned adapter. |
-| [`ArchV2LaunchLiquidityAdapter`](src/ArchV2LaunchLiquidityAdapter.sol) | Seeds an exact-ratio canonical V2 pair and locks or permanently sends its LP tokens. |
 | [`ArchV4LaunchLiquidityAdapter`](src/ArchV4LaunchLiquidityAdapter.sol) | Seeds a hookless, static-fee, full-range V4 position and locks or permanently sends its position NFT. |
-| [`ArchUserLiquidityProvisioner`](src/ArchUserLiquidityProvisioner.sol) | Adds post-deployment liquidity through one immutable family adapter without accepting a user-selected market, router, spender, or recipient. |
 | [`ArchV4UserLiquidityProvisioner`](src/ArchV4UserLiquidityProvisioner.sol) | Adds V4 liquidity through the fixed hookless pool key with explicit execution-price bounds and locked-or-burned custody. |
-| [`ArchV2SwapRouterAdapter`](src/ArchV2SwapRouterAdapter.sol) | Presents canonical V2 routing through the launch token's router boundary. |
+| [`ArchV2SwapRouterAdapter`](src/ArchV2SwapRouterAdapter.sol) | Maintained testnet compatibility route for the stock/WETH leg used by the active V4 tax-distribution path; it is not a V2 launch family. |
 | [`ArchV4SwapRouterAdapter`](src/ArchV4SwapRouterAdapter.sol) | Routes launch-token swaps through V4 and stock-token distribution through the configured V2 stock route. |
 | [`ArchPresaleDeployer`](src/ArchPresaleDeployer.sol) | Restricts presale deployment to its configured launchpad. |
 | [`ArchCurveDeployer`](src/ArchCurveDeployer.sol) | Restricts curve deployment to its configured launchpad. |
@@ -29,7 +27,7 @@ locked Uniswap V2, V3, or V4 liquidity on Robinhood Chain.
 ## Launch paths
 
 ```text
-V2, V3, or V4 launchpad
+V3 or V4 launchpad
   │
   ├── fixed-price presale
   │     contributions ──> soft/hard cap decision
@@ -45,30 +43,26 @@ V2, V3, or V4 launchpad
              remaining tokens + ETH ──> permanent liquidity position
 ```
 
-Each launch is a separate contract with immutable configuration. The V2 and V4
-families share launch accounting through `ArchAdapterPresale` and
-`ArchAdapterBondingCurve`, but they cannot choose an AMM at runtime. Each
-factory is permanently wired to its own adapter, router, locker, WETH, stock
-registry, and child deployers.
+Each launch is a separate contract with immutable configuration. V4 launch
+accounting uses `ArchAdapterPresale` and `ArchAdapterBondingCurve`; it cannot
+choose an AMM at runtime. Each factory is permanently wired to its adapter,
+router, locker, WETH, stock registry, and child deployers.
 
 ## Robinhood Chain testnet release
 
-The original V2/V4 release and the additive V2 user-liquidity release
-`robinhood-testnet-user-liquidity-2026-08-14-r1` are active on chain ID `46630`.
-The V2 fixture is included because the official Robinhood V2 addresses have no
-runtime code on testnet. The V4 family uses the live Robinhood testnet V4 stack.
+Release `robinhood-testnet-v4-user-liquidity-2026-08-15-r1` is active on chain
+ID `46630` and uses the live Robinhood testnet V4 stack.
 
-| Component | V2 | V4 |
-|---|---|---|
-| Launchpad | `0x3FD6651939A2138A5ecD4E17ba741e3ee0D6dfa6` | `0x94eEec9B20cDE4C58E7F982A863e913977AD73Ed` |
-| Token factory | `0xCB5756CAC20427a3d6536A7A55CC72B44dA9C1A7` | `0xFf575Bc8DFE5Dd34c17814f71D091F1692e531AF` |
-| Liquidity adapter | `0x050F2cF78d3D33e73777Db3BF0A6B476DB668A66` | `0x014e5142D5A6945930832506A5A99030F2B68A16` |
-| User-liquidity provisioner | `0xad16a8806EdF001c053A856bD625cbd720335CeA` | Not promoted |
-| Swap adapter | `0xb8525F9F98480d0A0f54A834f0A8d407D8CED3F2` | `0xa4C298f17d051634f59Dd37FEE05D4892a8153Ea` |
-| Locker | `0xb92D2c218bBb51C0F21fc12a6141596EafD98Def` | `0x8A1bC51e25b8799a5da57ff55f0262A405Ed2b98` |
-| Upstream factory or manager | `0x3d51588C41586Bc391A989156fBE6a7ceEd51446` | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
+| Component | V4 address |
+|---|---|
+| Launchpad | `0x45f7497ff12De39924905d9820A2E1CC60707302` |
+| Token factory | `0x897cd8ac993184d6dd3B549A5FbEc04f697C107c` |
+| Liquidity adapter | `0x7694D631107fea145d872A6003f40a2021F99343` |
+| User-liquidity provisioner | `0xba8cB9EE1Ea1126535C22d13805ec5cC22613775` |
+| Presale deployer | `0x873d07CD525F447BaC22607c6f535347e354f333` |
+| Curve deployer | `0x62FF5dB0062c39B6bc555CD745b1B4E1729f361F` |
+| Position locker | `0x8A1bC51e25b8799a5da57ff55f0262A405Ed2b98` |
 
-The V2 router is `0x42F1CF708A3DB2D4f3fF59FE400a8e4530662880`.
 The V4 PoolManager is `0x8366a39CC670B4001A1121B8F6A443A643e40951`.
 The signed release manifest and the complete address set live in the
 [integration contracts repository](https://github.com/ArchLiquid/archliquid-contracts).
@@ -78,9 +72,6 @@ The signed release manifest and the complete address set live in the
 The adapter boundary keeps launch accounting identical while enforcing the
 rules of the selected AMM:
 
-- V2 checks the router, factory, WETH, locker factory, exact seed consumption,
-  and canonical pair identity. Recoverable LP tokens go directly into the
-  locker; permanent liquidity is minted directly to the dead address.
 - V3 uses the original launch contracts and validates the deterministic pool's
   initial price before minting its full-range NFT.
 - V4 allows only hookless pools with a fixed 0.30% fee and tick spacing 60. It
@@ -111,8 +102,8 @@ IArchLaunchLiquidityAdapter.SeedResult memory result =
 token.addMarketPair(result.market);
 ```
 
-`permanent: true` is used for bonding-curve graduation. It sends the V2 LP
-tokens or V4 position directly to `0x000000000000000000000000000000000000dEaD`.
+`permanent: true` is used for V4 bonding-curve graduation. It sends the V4
+position directly to `0x000000000000000000000000000000000000dEaD`.
 
 For an already-wired token, users call the bound provisioner instead of the
 adapter. A token with no market supplies `address(0)` as `expectedMarket`; the
@@ -266,14 +257,14 @@ real ETH reaches `GRAD_ETH`, the same buy transaction creates V3 liquidity,
 burns the position NFT, finalizes token wiring, and disables further curve
 trading.
 
-## V2 and V4 deployment wiring
+## V4 deployment wiring
 
-The additive deployment script is [`DeployAmmModules.s.sol`](script/DeployAmmModules.s.sol).
-It refuses every chain except Robinhood testnet and validates every upstream
-dependency before broadcasting. It then deploys one complete V2 family and one
-complete V4 family without mutating the V3 release.
+The additive deployment script is
+[`DeployV4UserLiquidity.s.sol`](script/DeployV4UserLiquidity.s.sol). It refuses
+every chain except Robinhood testnet, validates every upstream dependency, and
+deploys a V4 family without mutating the V3 release.
 
-Each family is wired in this order:
+The family is wired in this order:
 
 1. Deploy the canonical locker, liquidity adapter, liquidity provisioner, swap
    adapter, token factory, child deployers, and launchpad.
@@ -285,9 +276,9 @@ Each family is wired in this order:
 5. Verify owner, immutable dependency, factory authorization, canonical AMM,
    and runtime-code invariants before promoting the manifest.
 
-The V2 fixture consumes version-pinned upstream artifacts. See
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for versions, checksums, and
-licenses.
+The retired V2 launch family is not supported for new launches. Its immutable
+testnet contracts and already-published source remain inspectable through
+Sourcify.
 
 ## Dependency pins
 
@@ -302,8 +293,8 @@ licenses.
 ## Tests
 
 The suites cover caps and windows, approved-stock enforcement, contribution and
-refund accounting, finalization atomicity, hostile pool initialization, exact
-V2 seeding, canonical-pair checks, V4 hook and fee policy, V4 Permit2 custody,
+refund accounting, finalization atomicity, hostile pool initialization, V4 hook
+and fee policy, V4 Permit2 custody,
 LP and position locking, team vesting, curve solvency, tax-aware swaps,
 distribution processing, graduation, permanent liquidity, deferred first-pair
 registration, refund rollback, donation resistance, reentrancy, exact approvals,
