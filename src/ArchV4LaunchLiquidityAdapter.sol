@@ -12,6 +12,7 @@ import {
     IPermit2AllowanceTransfer,
     IUniswapV4PoolManager,
     IUniswapV4PositionManager,
+    IUniswapV4PositionManagerDependencies,
     IUniswapV4StateView,
     PoolKey
 } from "./interfaces/IUniswapV4.sol";
@@ -77,6 +78,11 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
 
         address poolManager = positionManager.poolManager();
         require(poolManager.code.length > 0 && locker.POOL_MANAGER() == poolManager, "v4 adapter: pool mismatch");
+        require(stateView.poolManager() == poolManager, "v4 adapter: state view pool mismatch");
+        require(
+            IUniswapV4PositionManagerDependencies(address(positionManager)).permit2() == address(permit2),
+            "v4 adapter: permit2 mismatch"
+        );
 
         POSITION_MANAGER = positionManager;
         POOL_MANAGER = IUniswapV4PoolManager(poolManager);
@@ -219,6 +225,9 @@ contract ArchV4LaunchLiquidityAdapter is Ownable2Step, ReentrancyGuard, IArchLau
         token.forceApprove(address(PERMIT2), 0);
         WETH.forceApprove(address(PERMIT2), 0);
 
+        require(tokenId > 0, "v4 adapter: empty position");
+        (PoolKey memory mintedKey,) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
+        require(keccak256(abi.encode(mintedKey)) == poolId, "v4 adapter: position pool mismatch");
         require(POSITION_MANAGER.ownerOf(tokenId) == positionOwner, "v4 adapter: position owner mismatch");
         require(POSITION_MANAGER.getPositionLiquidity(tokenId) == liquidity, "v4 adapter: liquidity mismatch");
 

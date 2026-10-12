@@ -21,9 +21,10 @@ import {UniV3} from "@archliquid/core/lib/UniV3.sol";
 ///         no team allocation. Tokens are bought and sold against a
 ///         constant-product virtual-reserve curve with a flat protocol trade
 ///         fee. When the real ETH collected reaches the graduation threshold,
-///         all collected ETH and all remaining tokens are deposited into a
-///         Uniswap pool and the LP is burned forever, then the tax + stock
-///         distribution go live on the pair. Rounding always favors the
+///         accounted reserves seed a Uniswap position whose NFT is burned
+///         forever. Unused seed tokens go to DEAD and unused wrapped ETH goes
+///         to the treasury; tax and stock distribution go live on the pair.
+///         Rounding always favors the
 ///         contract so the curve can never be drained by rounding.
 contract ArchBondingCurve is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -88,6 +89,12 @@ contract ArchBondingCurve is ReentrancyGuard {
     event Bought(address indexed buyer, uint256 ethIn, uint256 fee, uint256 tokensOut);
     event Sold(address indexed seller, uint256 tokensIn, uint256 ethOut, uint256 fee);
     event Graduated(address indexed pair, uint256 ethToLp, uint256 tokensToLp);
+    event DonatedTokensBurned(uint256 tokenAmount);
+
+    /// @dev Only the immutable WETH contract may return graduation rounding dust.
+    receive() external payable {
+        require(msg.sender == address(WETH), "curve: only weth");
+    }
 
     constructor(address creator, Infra memory infra, TokenConfig memory t, CurveConfig memory c) {
         require(creator != address(0), "curve: zero creator");
@@ -126,6 +133,7 @@ contract ArchBondingCurve is ReentrancyGuard {
 
         uint256 curveSupply = (t.totalSupply * c.curvePct) / 100;
         require(curveSupply > 0, "curve: curve supply zero");
+        require(curveSupply > 1, "curve: no productive range");
         CURVE_SUPPLY = curveSupply;
         LP_SUPPLY = t.totalSupply - curveSupply;
         GRAD_ETH = c.gradEth;
@@ -179,6 +187,16 @@ contract ArchBondingCurve is ReentrancyGuard {
     /* ── trade ───────────────────────────────────────────────────── */
 
     function buy(uint256 minTokensOut) external payable nonReentrant {
+        _buy(minTokensOut);
+    }
+
+    /// @notice Execute a curve buy only through the caller's chosen deadline.
+    function buyWithDeadline(uint256 minTokensOut, uint256 deadline) external payable nonReentrant {
+        require(block.timestamp <= deadline, "curve: expired");
+        _buy(minTokensOut);
+    }
+
+    function _buy(uint256 minTokensOut) private {
         require(!graduated, "curve: graduated");
         require(msg.value > 0, "curve: zero value");
 
@@ -204,6 +222,16 @@ contract ArchBondingCurve is ReentrancyGuard {
     }
 
     function sell(uint256 tokensIn, uint256 minEthOut) external nonReentrant {
+        _sell(tokensIn, minEthOut);
+    }
+
+    /// @notice Execute a curve sell only through the caller's chosen deadline.
+    function sellWithDeadline(uint256 tokensIn, uint256 minEthOut, uint256 deadline) external nonReentrant {
+        require(block.timestamp <= deadline, "curve: expired");
+        _sell(tokensIn, minEthOut);
+    }
+
+    function _sell(uint256 tokensIn, uint256 minEthOut) private {
         require(!graduated, "curve: graduated");
         require(tokensIn > 0, "curve: zero tokens");
 
@@ -236,12 +264,20 @@ contract ArchBondingCurve is ReentrancyGuard {
         graduated = true;
         ArchToken t = token;
 
-        // all remaining tokens (curve leftover + reserved LP) and all collected
+        // Accounted curve inventory plus reserved LP, and all collected
         // ETH seed a full-range V3 position whose NFT is minted to the dead
         // address: liquidity is permanent
-        uint256 tokensToLp = t.balanceOf(address(this));
+        uint256 tokensToLp = tokenReserve + LP_SUPPLY;
+        uint256 actualInventory = t.balanceOf(address(this));
+        require(actualInventory >= tokensToLp, "curve: token inventory mismatch");
+        uint256 donatedTokens = actualInventory - tokensToLp;
+        if (donatedTokens > 0) {
+            IERC20(address(t)).safeTransfer(DEAD, donatedTokens);
+            emit DonatedTokensBurned(donatedTokens);
+        }
         uint256 ethToLp = realEthCollected;
         WETH.deposit{value: ethToLp}();
+        uint256 wethBefore = IERC20(address(WETH)).balanceOf(address(this));
 
         (address token0, address token1) = UniV3.sortTokens(address(t), address(WETH));
         (uint256 amount0, uint256 amount1) = token0 == address(t) ? (tokensToLp, ethToLp) : (ethToLp, tokensToLp);
@@ -267,7 +303,7 @@ contract ArchBondingCurve is ReentrancyGuard {
         t.approve(address(NFPM), tokensToLp);
         IERC20(address(WETH)).forceApprove(address(NFPM), ethToLp);
         (int24 tickLower, int24 tickUpper) = UniV3.fullRangeTicks(POOL_FEE);
-        NFPM.mint(
+        (uint256 positionId, uint128 liquidity, uint256 amount0Used, uint256 amount1Used) = NFPM.mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
@@ -283,7 +319,28 @@ contract ArchBondingCurve is ReentrancyGuard {
             })
         );
 
+        t.approve(address(NFPM), 0);
+        IERC20(address(WETH)).forceApprove(address(NFPM), 0);
+        (uint256 tokensUsed, uint256 wethUsed) =
+            token0 == address(t) ? (amount0Used, amount1Used) : (amount1Used, amount0Used);
+        require(positionId > 0 && liquidity > 0 && tokensUsed > 0 && wethUsed > 0, "curve: empty seed");
+        require(NFPM.ownerOf(positionId) == DEAD, "curve: invalid permanent custody");
+        require(tokensUsed <= tokensToLp && wethUsed <= ethToLp, "curve: seed overflow");
+        require(
+            t.balanceOf(address(this)) == tokensToLp - tokensUsed
+                && IERC20(address(WETH)).balanceOf(address(this)) == wethBefore - wethUsed,
+            "curve: seed accounting mismatch"
+        );
+        uint256 tokenDust = tokensToLp - tokensUsed;
+        if (tokenDust > 0) IERC20(address(t)).safeTransfer(DEAD, tokenDust);
+        uint256 wethDust = ethToLp - wethUsed;
+        if (wethDust > 0) {
+            WETH.withdraw(wethDust);
+            (bool refunded,) = TREASURY.call{value: wethDust}("");
+            require(refunded, "curve: dust send failed");
+        }
+
         t.finalizeWiring();
-        emit Graduated(p, ethToLp, tokensToLp);
+        emit Graduated(p, wethUsed, tokensUsed);
     }
 }
