@@ -22,6 +22,16 @@ import {
     IUniswapV4StateView
 } from "../src/interfaces/IUniswapV4.sol";
 
+// The deployment script verifies canonical V4 dependency links without
+// expanding the production adapters' deliberately minimal interfaces.
+interface IV4ReleasePositionManagerDependencies {
+    function permit2() external view returns (address);
+}
+
+interface IV4ReleaseStateViewDependencies {
+    function poolManager() external view returns (address);
+}
+
 /// @notice Additive V4-only release. It reuses the already-canary-tested V4
 ///         locker and swap adapter, and deploys a fresh immutable launch family
 ///         whose tokens are bound to the price-protected user provisioner.
@@ -121,19 +131,32 @@ contract DeployV4UserLiquidity is Script {
         IPermit2AllowanceTransfer permit2,
         ArchV4PositionLocker locker,
         ArchV4SwapRouterAdapter swapRouter
-    ) private view {
+    ) internal view {
         require(governance != address(0) && governance.balance >= MIN_GAS_BALANCE, "v4 release: signer balance");
         require(treasury != address(0), "v4 release: zero treasury");
         require(address(weth).code.length > 0, "v4 release: weth missing");
         require(address(registry).code.length > 0, "v4 release: registry missing");
+        // New tokens snapshot this executor during creation. An unset or
+        // unavailable executor would leave an otherwise deployed release unusable.
+        require(registry.stockSwapExecutor().code.length > 0, "v4 release: stock executor missing");
         require(address(positionManager).code.length > 0, "v4 release: position manager missing");
         require(address(stateView).code.length > 0, "v4 release: state view missing");
         require(address(permit2).code.length > 0, "v4 release: permit2 missing");
         require(address(locker).code.length > 0 && locker.owner() == governance, "v4 release: locker authority");
         require(address(swapRouter).code.length > 0, "v4 release: swap missing");
+        address poolManager = positionManager.poolManager();
+        require(poolManager.code.length > 0, "v4 release: pool manager missing");
+        require(
+            IV4ReleaseStateViewDependencies(address(stateView)).poolManager() == poolManager,
+            "v4 release: state view pool"
+        );
+        require(
+            IV4ReleasePositionManagerDependencies(address(positionManager)).permit2() == address(permit2),
+            "v4 release: position manager permit2"
+        );
         require(address(locker.POSITION_MANAGER()) == address(positionManager), "v4 release: locker manager");
-        require(locker.POOL_MANAGER() == positionManager.poolManager(), "v4 release: locker pool");
-        require(address(swapRouter.POOL_MANAGER()) == positionManager.poolManager(), "v4 release: swap pool");
+        require(locker.POOL_MANAGER() == poolManager, "v4 release: locker pool");
+        require(address(swapRouter.POOL_MANAGER()) == poolManager, "v4 release: swap pool");
         require(address(swapRouter.WETH()) == address(weth), "v4 release: swap weth");
     }
 

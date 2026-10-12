@@ -1,0 +1,2 @@
+# Keep Foundry formatting consistent across Windows and Linux.
+*.sol text eol=lf
