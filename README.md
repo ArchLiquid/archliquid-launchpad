@@ -276,6 +276,11 @@ The family is wired in this order:
 5. Verify owner, immutable dependency, factory authorization, canonical AMM,
    and runtime-code invariants before promoting the manifest.
 
+The [V4 release validation guide](docs/V4_RELEASE_CHECKS.md) explains deployment
+preflight and the configurable, spending-capped liquidity canary. Target the
+fresh factory explicitly, simulate the atomic custody checks, and review the
+result before broadcasting.
+
 The retired V2 launch family is not supported for new launches. Its immutable
 testnet contracts and already-published source remain inspectable through
 Sourcify.
