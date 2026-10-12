@@ -85,7 +85,7 @@ contract ArchBondingCurveTest is Test {
     function _create() internal returns (ArchBondingCurve) {
         vm.prank(creator);
         address c = launchpad.createCurve{value: LISTING_FEE}(_tokenCfg(), _curveCfg());
-        return ArchBondingCurve(c);
+        return ArchBondingCurve(payable(c));
     }
 
     function test_create_takesFeeAndHoldsSupply() public {

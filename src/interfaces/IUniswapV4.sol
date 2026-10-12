@@ -30,10 +30,17 @@ interface IUniswapV4PoolManager {
 }
 
 interface IUniswapV4StateView {
+    function poolManager() external view returns (address);
     function getSlot0(bytes32 poolId)
         external
         view
         returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee);
+}
+
+/// @dev Official PositionManager dependency getter, kept separate from the
+///      minimal position interface used by existing integrations and mocks.
+interface IUniswapV4PositionManagerDependencies {
+    function permit2() external view returns (address);
 }
 
 interface IPermit2AllowanceTransfer {

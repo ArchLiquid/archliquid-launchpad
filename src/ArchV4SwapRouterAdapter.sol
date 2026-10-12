@@ -88,7 +88,8 @@ contract ArchV4SwapRouterAdapter is ISwapRouter, ReentrancyGuard {
 
     /// @notice PoolManager callback. Input is synchronized and transferred
     ///         before the swap, so `paid` is the exact post-tax amount credited
-    ///         to this router. The swap then consumes exactly that credit.
+    ///         to this router. A price-limited swap may consume less than that credit;
+    ///         the unused input is returned directly to the original payer.
     function unlockCallback(bytes calldata rawData) external returns (bytes memory) {
         require(msg.sender == address(POOL_MANAGER), "v4 swap: only manager");
         CallbackData memory c = abi.decode(rawData, (CallbackData));
@@ -111,6 +112,14 @@ contract ArchV4SwapRouterAdapter is ISwapRouter, ReentrancyGuard {
         );
 
         (int128 delta0, int128 delta1) = _decodeDelta(delta);
+        int128 inputDelta = zeroForOne ? delta0 : delta1;
+        require(inputDelta < 0, "v4 swap: no input consumed");
+        // Widen before negation so the int128 minimum remains representable.
+        uint256 consumed = uint256(-int256(inputDelta));
+        require(consumed <= paid, "v4 swap: input delta exceeds paid");
+        uint256 unusedInput = paid - consumed;
+        if (unusedInput > 0) POOL_MANAGER.take(c.tokenIn, c.payer, unusedInput);
+
         int128 outputDelta = zeroForOne ? delta1 : delta0;
         require(outputDelta > 0, "v4 swap: no output credit");
         uint256 grossOutput = uint128(outputDelta);

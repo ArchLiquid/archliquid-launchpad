@@ -6,6 +6,15 @@ locked Uniswap V3 or V4 liquidity on Robinhood Chain.
 > **Status:** Live on Robinhood Chain testnet. Testnet assets have no monetary
 > value. Review the contract, network, and transaction details before signing.
 
+## Safer launch and trading flows
+
+New deployments include a seven-day finalization recovery window, caller-owned
+refund routing, expiring curve trades, explicit V4 graduation completion,
+bounded V4 liquidity inputs and price-limited swap refunds. Existing entry
+points are preserved. See the [launch safety and integration guide](docs/LAUNCH_SAFETY.md)
+for exact boundaries, compatibility changes and release checks. These source
+changes do not update the immutable contracts listed in the testnet release.
+
 ## What is included
 
 | Contract | Purpose |
@@ -118,9 +127,11 @@ refunded atomically.
 git clone --recurse-submodules https://github.com/ArchLiquid/archliquid-launchpad.git
 cd archliquid-launchpad
 forge build
-forge test
+forge test --no-match-path 'test/*Fork.t.sol'
 forge build --sizes
 ```
+
+Install Foundry v1.8.5 for the same toolchain used by CI.
 
 The exact compiler configuration and remappings to Core, Lockers, and Token are
 defined in [`foundry.toml`](foundry.toml).
@@ -187,8 +198,8 @@ sale.finalize();
 sale.claim();
 ```
 
-The code derives a fixed token price so a full hard-cap raise sells exactly the
-sale allocation. A successful raise sends 3% to the treasury and uses the
+The code derives a fixed token price from the hard cap and sale allocation.
+Claims use floor rounding; quoteContribution() previews the same arithmetic. A successful raise sends 3% to the treasury and uses the
 remaining ETH to seed V3 liquidity. The position is locked for the configured
 duration; the team receives no contributed ETH.
 
@@ -244,11 +255,11 @@ graduation reachable within the productive curve range.
 ArchBondingCurve market = ArchBondingCurve(payable(curve));
 
 (uint256 quotedTokens, uint256 fee) = market.quoteBuy(1 ether);
-market.buy{value: 1 ether}(quotedTokens * 99 / 100);
+market.buyWithDeadline{value: 1 ether}(quotedTokens * 99 / 100, block.timestamp + 5 minutes);
 
 (uint256 quotedEth,) = market.quoteSell(tokensToSell);
 IERC20(address(market.token())).approve(address(market), tokensToSell);
-market.sell(tokensToSell, quotedEth * 99 / 100);
+market.sellWithDeadline(tokensToSell, quotedEth * 99 / 100, block.timestamp + 5 minutes);
 ```
 
 Curve trades charge a fixed 1% treasury fee. Quote methods are views, while

@@ -222,6 +222,32 @@ contract ArchV4LaunchLiquidityAdapterForkTest is Test {
         assertEq(launchToken.balanceOf(bob) - bobBefore, netBought);
         assertGt(launchToken.balanceOf(address(launchToken)), 300e18);
 
+        // A restrictive price limit must produce a partial fill and return
+        // unused WETH to its payer without leaving PoolManager currency credit.
+        (uint160 currentSqrtPrice,,,) = STATE_VIEW.getSlot0(seeded.poolId);
+        bool wethIsCurrency0 = address(weth) < address(launchToken);
+        uint160 priceLimit =
+            uint160(wethIsCurrency0 ? uint256(currentSqrtPrice) * 999 / 1000 : uint256(currentSqrtPrice) * 1001 / 1000);
+        weth.transfer(bob, 1 ether);
+        uint256 bobWethBefore = weth.balanceOf(bob);
+        vm.prank(bob);
+        uint256 partialBought = v4Router.exactInputSingle(
+            ISwapRouter.ExactInputSingleParams({
+                tokenIn: address(weth),
+                tokenOut: address(launchToken),
+                fee: 3000,
+                recipient: bob,
+                amountIn: 1 ether,
+                amountOutMinimum: 1,
+                sqrtPriceLimitX96: priceLimit
+            })
+        );
+        assertGt(partialBought, 0);
+        uint256 wethConsumed = bobWethBefore - weth.balanceOf(bob);
+        assertGt(wethConsumed, 0);
+        assertLt(wethConsumed, 1 ether);
+        assertEq(weth.balanceOf(address(v4Router)), 0);
+
         uint256 treasuryBefore = address(treasury).balance;
         launchToken.processDistribution(1, 1);
         assertGt(address(treasury).balance, treasuryBefore);

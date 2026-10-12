@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ArchToken} from "@archliquid/token/ArchToken.sol";
 import {ArchTokenDeployLib} from "./lib/ArchTokenDeployLib.sol";
 import {IArchStockSwapExecutor} from "@archliquid/core/interfaces/IArchStockSwapExecutor.sol";
@@ -13,13 +14,15 @@ import {ISwapRouter, IWETH9} from "@archliquid/core/interfaces/IUniswapV3.sol";
 /// @title ArchAdapterPresale
 /// @notice Fixed-price presale for a versioned AMM adapter. The successful
 ///         raise seeds adapter-custodied liquidity; a failed pool preparation
-///         leaves the full raise refundable.
+///         leaves the full raise refundable. Unsettled sales become refundable
+///         seven days after END, even when another finalization step reverts.
 contract ArchAdapterPresale is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
     uint16 public constant RAISE_FEE_BPS = 300;
     uint64 public constant MIN_LP_LOCK = 30 days;
+    uint64 public constant FINALIZATION_GRACE_PERIOD = 7 days;
 
     struct Infra {
         address payable treasury;
@@ -110,6 +113,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
     event Canceled();
     event Claimed(address indexed who, uint256 tokenAmount);
     event Refunded(address indexed who, uint256 amount);
+    event RefundRouted(address indexed contributor, address indexed recipient, uint256 amount);
     event TeamClaimed(uint256 tokenAmount);
 
     /// @dev Accept native ETH only from the immutable WETH contract while
@@ -129,6 +133,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
         require(address(infra.stockSwapExecutor) != address(0), "adapter presale: zero executor");
         require(s.hardCap >= s.softCap && s.softCap > 0, "adapter presale: bad caps");
         require(s.end > s.start && s.start >= block.timestamp, "adapter presale: bad window");
+        require(s.end <= type(uint64).max - FINALIZATION_GRACE_PERIOD, "adapter presale: deadline overflow");
         require(s.salePct > 0 && s.lpPct > 0, "adapter presale: zero alloc");
         require(uint256(s.salePct) + s.lpPct <= 100, "adapter presale: alloc over 100");
         require(s.poolFee == infra.tokenPoolFee, "adapter presale: wrong pool fee");
@@ -180,12 +185,24 @@ contract ArchAdapterPresale is ReentrancyGuard {
         infra.liquidityAdapter.validateSeedAmounts(lpTokens, _liquidityEth(s.hardCap));
     }
 
+    /// @notice Token base units quoted for a cumulative contribution in wei.
+    /// @dev Caps and sale state are checked separately by contribute().
+    function quoteContribution(uint256 amount) public view returns (uint256) {
+        return Math.mulDiv(amount, TOKENS_PER_ETH, 1e18);
+    }
+
+    /// @notice Exclusive finalization deadline; refunds may open at this time.
+    function finalizationDeadline() public view returns (uint64) {
+        return END + FINALIZATION_GRACE_PERIOD;
+    }
+
     function contribute() external payable nonReentrant {
         require(block.timestamp >= START && block.timestamp < END, "adapter presale: not open");
         require(!finalized && !canceled, "adapter presale: closed");
         require(msg.value > 0, "adapter presale: zero value");
         require(totalRaised + msg.value <= HARD_CAP, "adapter presale: over hard cap");
         uint256 newContribution = contributed[msg.sender] + msg.value;
+        require(quoteContribution(newContribution) > 0, "adapter presale: contribution rounds to zero");
         if (PER_WALLET_CAP > 0) require(newContribution <= PER_WALLET_CAP, "adapter presale: over wallet cap");
         contributed[msg.sender] = newContribution;
         totalRaised += msg.value;
@@ -196,6 +213,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
     function finalize() external nonReentrant {
         require(!finalized && !canceled, "adapter presale: already settled");
         require(block.timestamp >= END || totalRaised == HARD_CAP, "adapter presale: not ended");
+        require(block.timestamp < finalizationDeadline(), "adapter presale: finalization expired");
         require(totalRaised >= SOFT_CAP, "adapter presale: soft cap missed");
 
         uint256 fee = (totalRaised * RAISE_FEE_BPS) / 10_000;
@@ -235,6 +253,8 @@ contract ArchAdapterPresale is ReentrancyGuard {
         WETH.deposit{value: lpEth}();
         IERC20(address(created)).forceApprove(address(LIQUIDITY_ADAPTER), LP_TOKENS);
         IERC20(address(WETH)).forceApprove(address(LIQUIDITY_ADAPTER), lpEth);
+        uint256 tokenBefore = created.balanceOf(address(this));
+        uint256 wethBefore = WETH.balanceOf(address(this));
 
         IArchLaunchLiquidityAdapter.SeedResult memory seeded;
         try LIQUIDITY_ADAPTER.seed(
@@ -263,6 +283,12 @@ contract ArchAdapterPresale is ReentrancyGuard {
         IERC20(address(WETH)).forceApprove(address(LIQUIDITY_ADAPTER), 0);
         require(seeded.tokenUsed > 0 && seeded.wethUsed > 0, "adapter presale: empty seed");
         require(seeded.tokenUsed <= LP_TOKENS && seeded.wethUsed <= lpEth, "adapter presale: seed overflow");
+        // Cross-check the adapter's return tuple before treating unused input
+        // as dust. False consumption reports must not burn claim allocations.
+        require(
+            created.balanceOf(address(this)) == tokenBefore - seeded.tokenUsed, "adapter presale: token input mismatch"
+        );
+        require(WETH.balanceOf(address(this)) == wethBefore - seeded.wethUsed, "adapter presale: weth input mismatch");
 
         finalized = true;
         token = created;
@@ -278,7 +304,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
 
         uint256 lpTokenDust = LP_TOKENS - seeded.tokenUsed;
         if (lpTokenDust > 0) IERC20(address(created)).safeTransfer(DEAD, lpTokenDust);
-        uint256 sold = (totalRaised * TOKENS_PER_ETH) / 1e18;
+        uint256 sold = quoteContribution(totalRaised);
         uint256 unsold = SALE_TOKENS - sold;
         if (unsold > 0) IERC20(address(created)).safeTransfer(DEAD, unsold);
 
@@ -294,10 +320,12 @@ contract ArchAdapterPresale is ReentrancyGuard {
         );
     }
 
+    /// @notice Open refunds below soft cap after END, or for any unsettled sale
+    ///         once the finalization deadline is reached.
     function cancel() external nonReentrant {
         require(!finalized && !canceled, "adapter presale: already settled");
         require(block.timestamp >= END, "adapter presale: not ended");
-        require(totalRaised < SOFT_CAP, "adapter presale: soft cap met");
+        require(totalRaised < SOFT_CAP || block.timestamp >= finalizationDeadline(), "adapter presale: soft cap met");
         canceled = true;
         emit Canceled();
     }
@@ -305,7 +333,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
     function claim() external nonReentrant {
         require(finalized, "adapter presale: not finalized");
         require(!claimed[msg.sender], "adapter presale: already claimed");
-        uint256 amount = (contributed[msg.sender] * TOKENS_PER_ETH) / 1e18;
+        uint256 amount = quoteContribution(contributed[msg.sender]);
         require(amount > 0, "adapter presale: nothing to claim");
         claimed[msg.sender] = true;
         IERC20(address(token)).safeTransfer(msg.sender, amount);
@@ -313,13 +341,25 @@ contract ArchAdapterPresale is ReentrancyGuard {
     }
 
     function refund() external nonReentrant {
+        _refund(payable(msg.sender));
+    }
+
+    /// @notice Route only your own canceled-sale contribution to a receiver
+    ///         that can accept ETH. Refunded remains attributed to the caller.
+    function refundTo(address payable recipient) external nonReentrant {
+        require(recipient != address(0), "adapter presale: zero recipient");
+        _refund(recipient);
+    }
+
+    function _refund(address payable recipient) private {
         require(canceled, "adapter presale: not canceled");
         uint256 amount = contributed[msg.sender];
         require(amount > 0, "adapter presale: nothing to refund");
         contributed[msg.sender] = 0;
-        (bool refunded,) = payable(msg.sender).call{value: amount}("");
+        (bool refunded,) = recipient.call{value: amount}("");
         require(refunded, "adapter presale: refund failed");
         emit Refunded(msg.sender, amount);
+        if (recipient != msg.sender) emit RefundRouted(msg.sender, recipient, amount);
     }
 
     function teamVested() public view returns (uint256) {
@@ -339,7 +379,7 @@ contract ArchAdapterPresale is ReentrancyGuard {
 
     function claimable(address who) external view returns (uint256) {
         if (claimed[who]) return 0;
-        return (contributed[who] * TOKENS_PER_ETH) / 1e18;
+        return quoteContribution(contributed[who]);
     }
 
     function _liquidityEth(uint256 raised) private pure returns (uint256) {

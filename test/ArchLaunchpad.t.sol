@@ -106,7 +106,7 @@ contract ArchLaunchpadTest is Test {
     function _create() internal returns (ArchPresale) {
         vm.prank(creator);
         address p = launchpad.createPresale{value: LISTING_FEE}(_tokenCfg(), _saleCfg());
-        return ArchPresale(p);
+        return ArchPresale(payable(p));
     }
 
     function test_create_takesListingFee() public {
