@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ArchToken} from "@archliquid/token/ArchToken.sol";
 import {IArchStockSwapExecutor} from "@archliquid/core/interfaces/IArchStockSwapExecutor.sol";
 import {ArchV3PositionLocker} from "@archliquid/lockers/ArchV3PositionLocker.sol";
@@ -19,10 +20,12 @@ import {ArchTokenDeployLib} from "./lib/ArchTokenDeployLib.sol";
 /// @title ArchPresale
 /// @notice One fixed-price presale of an RWA distributor token. The trust
 ///         guarantee: every contributed wei, minus the flat protocol raise
-///         fee, becomes locked liquidity at finalize. The team receives no
+///         fee and liquidity rounding dust, becomes locked liquidity at finalize.
+///         Rounding dust goes to the treasury. The team receives no
 ///         ETH from the raise, only tokens vested (cliff + linear) inside this
 ///         contract. If the soft cap is missed, contributors take a full
-///         refund. There is no owner and no path for anyone to move escrowed
+///         refund. A sale that cannot finalize within seven days after END also
+///         opens full refunds. There is no owner and no path to move escrowed
 ///         ETH except refunds or the finalize flow.
 contract ArchPresale is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -64,6 +67,7 @@ contract ArchPresale is ReentrancyGuard {
     }
 
     uint16 public constant RAISE_FEE_BPS = 300; // 3%
+    uint64 public constant FINALIZATION_GRACE_PERIOD = 7 days;
 
     address public immutable CREATOR;
     address payable public immutable TREASURY;
@@ -102,13 +106,13 @@ contract ArchPresale is ReentrancyGuard {
     mapping(address => uint256) public contributed;
     mapping(address => bool) public claimed;
     uint256 public teamReleased;
-    // accumulated over every contribution; seeds the token's CREATE2 salt so
-    // the launch pool address cannot be pre-computed (and thus pre-initialized)
-    // by a griefer before finalize
+    // Varies the token's CREATE2 salt across contributions and blocks. These
+    // inputs are public and may be predicted or influenced by block producers;
+    // the pool price guard and timeout refunds provide the fund protection.
     bytes32 private _entropy;
 
     bool public finalized;
-    bool public canceled; // soft cap missed after end
+    bool public canceled; // missed cap, unsafe pool, or expired finalization
     ArchToken public token;
     address public pair;
 
@@ -117,7 +121,13 @@ contract ArchPresale is ReentrancyGuard {
     event Canceled();
     event Claimed(address indexed who, uint256 tokenAmount);
     event Refunded(address indexed who, uint256 amount);
+    event RefundRouted(address indexed contributor, address indexed recipient, uint256 amount);
     event TeamClaimed(uint256 tokenAmount);
+
+    /// @dev Accept ETH only when the immutable WETH unwraps unused mint input.
+    receive() external payable {
+        require(msg.sender == address(WETH), "presale: only weth");
+    }
 
     constructor(address creator, Infra memory infra, TokenConfig memory t, SaleConfig memory s) {
         require(creator != address(0), "presale: zero creator");
@@ -126,6 +136,7 @@ contract ArchPresale is ReentrancyGuard {
         require(address(infra.stockSwapExecutor) != address(0), "presale: zero executor");
         require(s.hardCap >= s.softCap && s.softCap > 0, "presale: bad caps");
         require(s.end > s.start && s.start >= block.timestamp, "presale: bad window");
+        require(s.end <= type(uint64).max - FINALIZATION_GRACE_PERIOD, "presale: deadline overflow");
         require(s.salePct > 0 && s.lpPct > 0, "presale: zero alloc");
         require(uint256(s.salePct) + s.lpPct <= 100, "presale: alloc over 100");
         require(s.lpLockDuration >= infra.locker.MIN_DURATION(), "presale: lock too short");
@@ -177,7 +188,8 @@ contract ArchPresale is ReentrancyGuard {
         SALE_TOKENS = saleTokens;
         LP_TOKENS = lpTokens;
         TEAM_TOKENS = t.totalSupply - saleTokens - lpTokens;
-        // fixed price: a full hard-cap raise sells exactly SALE_TOKENS
+        // Fixed price with floor rounding. A hard-cap raise sells at most
+        // SALE_TOKENS; aggregate and per-wallet claims may round down further.
         TOKENS_PER_ETH = (saleTokens * 1e18) / s.hardCap;
         require(TOKENS_PER_ETH > 0, "presale: price rounds to zero");
 
@@ -192,6 +204,18 @@ contract ArchPresale is ReentrancyGuard {
 
     /* ── contribute ──────────────────────────────────────────────── */
 
+    /// @notice Token base units quoted for a cumulative contribution in wei.
+    /// @dev This previews fixed-price rounding; caps and sale state are checked
+    ///      separately by contribute(). Splitting across wallets can round down.
+    function quoteContribution(uint256 amount) public view returns (uint256) {
+        return Math.mulDiv(amount, TOKENS_PER_ETH, 1e18);
+    }
+
+    /// @notice Exclusive finalization deadline; refunds may open at this time.
+    function finalizationDeadline() public view returns (uint64) {
+        return END + FINALIZATION_GRACE_PERIOD;
+    }
+
     function contribute() external payable nonReentrant {
         require(block.timestamp >= START && block.timestamp < END, "presale: not open");
         require(!finalized && !canceled, "presale: closed");
@@ -199,6 +223,7 @@ contract ArchPresale is ReentrancyGuard {
         require(totalRaised + msg.value <= HARD_CAP, "presale: over hard cap");
 
         uint256 newContribution = contributed[msg.sender] + msg.value;
+        require(quoteContribution(newContribution) > 0, "presale: contribution rounds to zero");
         if (PER_WALLET_CAP > 0) {
             require(newContribution <= PER_WALLET_CAP, "presale: over wallet cap");
         }
@@ -220,19 +245,16 @@ contract ArchPresale is ReentrancyGuard {
     function finalize() external nonReentrant {
         require(!finalized && !canceled, "presale: already settled");
         require(block.timestamp >= END || totalRaised == HARD_CAP, "presale: not ended");
+        require(block.timestamp < finalizationDeadline(), "presale: finalization expired");
         require(totalRaised >= SOFT_CAP, "presale: soft cap missed");
 
         uint256 fee = (totalRaised * RAISE_FEE_BPS) / 10_000;
         uint256 lpEth = totalRaised - fee;
 
-        // Deploy via CREATE2 with an entropy- and block-derived salt. Fund
-        // safety does not rest on this: a pre-initialized pool is caught by the
-        // price guard below, which cancels to full refunds. The salt raises the
-        // cost of the liveness griefing by rotating the address every block and
-        // mixing in the per-contribution entropy; where block entropy is real
-        // the address is not knowable ahead of time, and on Arbitrum Orbit
-        // (constant prevrandao) blockhash still rotates it per block. Either
-        // way, a griefed launch downgrades to a refund, never a lock.
+        // Deploy via CREATE2 with a contribution- and block-derived salt.
+        // It varies the address without assuming cryptographic unpredictability.
+        // A hostile starting price cancels to refunds, and other settlement
+        // failures remain recoverable through the finalization timeout.
         bytes32 salt = keccak256(
             abi.encode(
                 address(this), _entropy, blockhash(block.number - 1), block.number, block.timestamp, block.prevrandao
@@ -285,10 +307,6 @@ contract ArchPresale is ReentrancyGuard {
         pair = p;
         t.addMarketPair(p);
 
-        // fee to treasury, then everything else is locked liquidity
-        (bool okFee,) = TREASURY.call{value: fee}("");
-        require(okFee, "presale: fee send failed");
-
         // exclude all infrastructure and custody addresses from dividends so
         // unclaimed, team-held and locked tokens do not strand stock payouts
         t.setDividendExempt(address(this));
@@ -296,19 +314,21 @@ contract ArchPresale is ReentrancyGuard {
         t.setDividendExempt(DEAD);
         t.setDividendExempt(address(LOCKER));
 
-        // seed and lock liquidity: every raised wei minus fee becomes a
-        // full-range V3 position, locked for the creator
-        uint256 lockId = _seedAndLockLiquidity(t, lpEth);
+        // Lock actual mint consumption. As in adapter launches, unconsumed
+        // token input is burned and WETH rounding dust goes to the treasury.
+        (uint256 lockId, uint256 wethUsed) = _seedAndLockLiquidity(t, lpEth);
+        (bool okFee,) = TREASURY.call{value: fee + lpEth - wethUsed}("");
+        require(okFee, "presale: fee send failed");
 
         // burn sale tokens that went unsold in an under-filled raise. Team
         // tokens remain in this contract and vest to the creator via
         // claimTeam(); contributor tokens remain for claim().
-        uint256 sold = (totalRaised * TOKENS_PER_ETH) / 1e18;
+        uint256 sold = quoteContribution(totalRaised);
         uint256 unsold = SALE_TOKENS - sold;
         if (unsold > 0) IERC20(address(t)).safeTransfer(DEAD, unsold);
 
         t.finalizeWiring();
-        emit Finalized(address(t), p, totalRaised, lpEth, lockId);
+        emit Finalized(address(t), p, totalRaised, wethUsed, lockId);
     }
 
     /// @dev Compute the intended seed price and create + initialize the V3 pool
@@ -336,7 +356,7 @@ contract ArchPresale is ReentrancyGuard {
 
     /// @dev Wrap the ETH and mint a full-range position on the already
     ///      created + price-verified pool, then lock the NFT for the creator.
-    function _seedAndLockLiquidity(ArchToken t, uint256 lpEth) private returns (uint256 lockId) {
+    function _seedAndLockLiquidity(ArchToken t, uint256 lpEth) private returns (uint256 lockId, uint256 wethUsed) {
         WETH.deposit{value: lpEth}();
 
         (address token0, address token1) = UniV3.sortTokens(address(t), address(WETH));
@@ -344,8 +364,10 @@ contract ArchPresale is ReentrancyGuard {
 
         t.approve(address(NFPM), LP_TOKENS);
         IERC20(address(WETH)).forceApprove(address(NFPM), lpEth);
+        uint256 tokenBefore = t.balanceOf(address(this));
+        uint256 wethBefore = WETH.balanceOf(address(this));
         (int24 tickLower, int24 tickUpper) = UniV3.fullRangeTicks(POOL_FEE);
-        (uint256 tokenId,,,) = NFPM.mint(
+        (uint256 tokenId, uint128 liquidity, uint256 used0, uint256 used1) = NFPM.mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
@@ -360,15 +382,31 @@ contract ArchPresale is ReentrancyGuard {
                 deadline: block.timestamp
             })
         );
+        require(tokenId > 0 && liquidity > 0 && used0 > 0 && used1 > 0, "presale: empty seed");
+        require(used0 <= amount0 && used1 <= amount1, "presale: seed overflow");
+        uint256 tokenUsed = token0 == address(t) ? used0 : used1;
+        wethUsed = token0 == address(t) ? used1 : used0;
+        // A return tuple alone cannot establish consumption. These deltas keep
+        // false reports from burning contributor or team allocations as dust.
+        require(t.balanceOf(address(this)) == tokenBefore - tokenUsed, "presale: token input mismatch");
+        require(WETH.balanceOf(address(this)) == wethBefore - wethUsed, "presale: weth input mismatch");
+        IERC20(address(t)).forceApprove(address(NFPM), 0);
+        IERC20(address(WETH)).forceApprove(address(NFPM), 0);
         NFPM.approve(address(LOCKER), tokenId);
         lockId = LOCKER.lock(NFPM, tokenId, uint64(block.timestamp) + LP_LOCK_DURATION, CREATOR);
+        uint256 lpTokenDust = LP_TOKENS - tokenUsed;
+        if (lpTokenDust > 0) IERC20(address(t)).safeTransfer(DEAD, lpTokenDust);
+        uint256 wethDust = lpEth - wethUsed;
+        if (wethDust > 0) WETH.withdraw(wethDust);
     }
 
-    /// @notice After the window closes below the soft cap, open refunds.
+    /// @notice Open refunds below soft cap after END, or for any unsettled sale
+    ///         once the finalization deadline is reached. No failed transaction
+    ///         proof or creator permission is needed to recover escrowed ETH.
     function cancel() external nonReentrant {
         require(!finalized && !canceled, "presale: already settled");
         require(block.timestamp >= END, "presale: not ended");
-        require(totalRaised < SOFT_CAP, "presale: soft cap met");
+        require(totalRaised < SOFT_CAP || block.timestamp >= finalizationDeadline(), "presale: soft cap met");
         canceled = true;
         emit Canceled();
     }
@@ -378,7 +416,7 @@ contract ArchPresale is ReentrancyGuard {
     function claim() external nonReentrant {
         require(finalized, "presale: not finalized");
         require(!claimed[msg.sender], "presale: already claimed");
-        uint256 amount = (contributed[msg.sender] * TOKENS_PER_ETH) / 1e18;
+        uint256 amount = quoteContribution(contributed[msg.sender]);
         require(amount > 0, "presale: nothing to claim");
         claimed[msg.sender] = true;
         IERC20(address(token)).safeTransfer(msg.sender, amount);
@@ -386,13 +424,25 @@ contract ArchPresale is ReentrancyGuard {
     }
 
     function refund() external nonReentrant {
+        _refund(payable(msg.sender));
+    }
+
+    /// @notice Route only your own canceled-sale contribution to a receiver
+    ///         that can accept ETH. Useful for contract wallets rejecting ETH.
+    function refundTo(address payable recipient) external nonReentrant {
+        require(recipient != address(0), "presale: zero recipient");
+        _refund(recipient);
+    }
+
+    function _refund(address payable recipient) private {
         require(canceled, "presale: not canceled");
         uint256 amount = contributed[msg.sender];
         require(amount > 0, "presale: nothing to refund");
         contributed[msg.sender] = 0;
-        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        (bool ok,) = recipient.call{value: amount}("");
         require(ok, "presale: refund failed");
         emit Refunded(msg.sender, amount);
+        if (recipient != msg.sender) emit RefundRouted(msg.sender, recipient, amount);
     }
 
     /* ── team vesting (cliff + linear, creator only) ─────────────── */
@@ -418,6 +468,6 @@ contract ArchPresale is ReentrancyGuard {
     /// @notice Tokens a contributor will receive at claim.
     function claimable(address who) external view returns (uint256) {
         if (claimed[who]) return 0;
-        return (contributed[who] * TOKENS_PER_ETH) / 1e18;
+        return quoteContribution(contributed[who]);
     }
 }

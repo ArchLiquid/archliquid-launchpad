@@ -253,9 +253,15 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         assertEq(firstLock.tokenId, first.positionIdOrAmount);
 
         (uint160 currentSqrt,,,) = STATE_VIEW.getSlot0(first.poolId);
+        ArchV4UserLiquidityProvisioner.LiquidityLimits memory limits = ArchV4UserLiquidityProvisioner.LiquidityLimits({
+            deadline: block.timestamp + 1 minutes,
+            minTokenUsed: tokenAmount * 99 / 100,
+            minWethUsed: ethAmount * 99 / 100,
+            minLiquidity: POSITION_MANAGER.getPositionLiquidity(first.positionIdOrAmount)
+        });
         vm.prank(alice);
-        IArchLaunchLiquidityAdapter.SeedResult memory second = provisioner.addLiquidity{value: ethAmount}(
-            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 45 days, false
+        IArchLaunchLiquidityAdapter.SeedResult memory second = provisioner.addLiquidityWithLimits{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 45 days, false, limits
         );
         assertEq(second.poolId, first.poolId);
         assertEq(POSITION_MANAGER.ownerOf(second.positionIdOrAmount), address(locker));
@@ -277,8 +283,8 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         );
 
         vm.prank(alice);
-        IArchLaunchLiquidityAdapter.SeedResult memory permanent = provisioner.addLiquidity{value: ethAmount}(
-            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 0, true
+        IArchLaunchLiquidityAdapter.SeedResult memory permanent = provisioner.addLiquidityWithLimits{value: ethAmount}(
+            token, tokenAmount, poolManager, currentSqrt, currentSqrt, 0, true, limits
         );
         assertEq(POSITION_MANAGER.ownerOf(permanent.positionIdOrAmount), DEAD);
         assertEq(permanent.lockId, type(uint256).max);
@@ -366,5 +372,48 @@ contract ArchAdapterLaunchpadV4ForkTest is Test {
         assertEq(curve.pair(), POSITION_MANAGER.poolManager());
         assertTrue(curve.token().isMarketPair(POSITION_MANAGER.poolManager()));
         assertEq(curve.token().balanceOf(address(curve)), 0);
+    }
+
+    function test_terminalRoundingCompletionCreatesPermanentLiveV4Position() public {
+        ArchAdapterBondingCurve.TokenConfig memory tokenConfig = ArchAdapterBondingCurve.TokenConfig({
+            name: "V4 Plateau",
+            symbol: "V4P",
+            totalSupply: 1 ether,
+            taxBps: 300,
+            stock: IERC20(address(stock)),
+            creatorFeeBps: 0
+        });
+        ArchAdapterBondingCurve.CurveConfig memory curveConfig = ArchAdapterBondingCurve.CurveConfig({
+            curvePct: 80, virtualEth: 2 ether, gradEth: 10 ether, poolFee: V4_FEE
+        });
+        vm.prank(creator);
+        ArchAdapterBondingCurve curve =
+            ArchAdapterBondingCurve(payable(launchpad.createCurve{value: LISTING_FEE}(tokenConfig, curveConfig)));
+        ArchToken token = curve.token();
+        uint256 net = 10 ether - 1;
+        vm.prank(alice);
+        curve.buyWithDeadline{value: net + net / 99}(0, block.timestamp);
+        uint256 completionAmount = curve.graduationBuyAmount();
+        (uint256 tokensOut,) = curve.quoteBuy(completionAmount);
+        assertEq(completionAmount, 1);
+        assertEq(tokensOut, 0);
+        vm.expectRevert("adapter curve: slippage");
+        vm.prank(alice);
+        curve.buy{value: completionAmount}(0);
+
+        uint256 buyerTokensBefore = token.balanceOf(alice);
+        uint256 positionId = POSITION_MANAGER.nextTokenId();
+        vm.prank(alice);
+        curve.completeGraduation{value: completionAmount}(block.timestamp);
+        assertTrue(curve.graduated());
+        assertEq(curve.realEthCollected(), 10 ether);
+        assertEq(token.balanceOf(alice), buyerTokensBefore);
+        assertTrue(token.wired());
+        assertEq(POSITION_MANAGER.ownerOf(positionId), DEAD);
+        assertGt(POSITION_MANAGER.getPositionLiquidity(positionId), 0);
+        assertEq(token.balanceOf(address(curve)), 0);
+        assertEq(weth.balanceOf(address(curve)), 0);
+        assertEq(token.allowance(address(curve), address(liquidityAdapter)), 0);
+        assertEq(weth.allowance(address(curve), address(liquidityAdapter)), 0);
     }
 }

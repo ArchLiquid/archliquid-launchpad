@@ -78,6 +78,9 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
 
     event Bought(address indexed buyer, uint256 ethIn, uint256 fee, uint256 tokensOut);
     event Sold(address indexed seller, uint256 tokensIn, uint256 ethOut, uint256 fee);
+    event DonatedTokensBurned(uint256 tokenAmount);
+    /// @notice Explicit remaining funding with zero tokens received by the payer.
+    event GraduationCompleted(address indexed payer, uint256 ethIn, uint256 fee, uint256 tokensOut);
     event Graduated(
         address indexed market,
         bytes32 indexed poolId,
@@ -135,7 +138,9 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
         tokenReserve = curveSupply;
         K = uint256(c.virtualEth) * curveSupply;
 
-        uint256 tokensAtGraduation = Math.ceilDiv(K, uint256(c.virtualEth) + c.gradEth) + LP_SUPPLY;
+        uint256 terminalReserve = Math.ceilDiv(K, uint256(c.virtualEth) + c.gradEth);
+        require(terminalReserve < curveSupply, "adapter curve: no productive range");
+        uint256 tokensAtGraduation = terminalReserve + LP_SUPPLY;
         infra.liquidityAdapter.validateSeedAmounts(tokensAtGraduation, c.gradEth);
 
         token = ArchTokenDeployLib.deploy(
@@ -178,13 +183,27 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
 
     /// @notice Exact gross ETH that reaches the remaining graduation target
     ///         after the 1% floor-rounded trade fee. Frontends can use this to
-    ///         avoid an overshooting transaction near graduation.
+    ///         avoid an overshooting transaction near graduation. This quote may
+    ///         have zero token output; it does not authorize automatic completion.
     function graduationBuyAmount() external view returns (uint256) {
+        return _graduationBuyAmount();
+    }
+
+    function _graduationBuyAmount() private view returns (uint256) {
         uint256 remaining = uint256(GRAD_ETH) - realEthCollected;
         return remaining == 0 ? 0 : remaining + (remaining / 99);
     }
 
     function buy(uint256 minTokensOut) external payable nonReentrant {
+        _buy(minTokensOut);
+    }
+
+    function buyWithDeadline(uint256 minTokensOut, uint256 deadline) external payable nonReentrant {
+        require(block.timestamp <= deadline, "adapter curve: expired");
+        _buy(minTokensOut);
+    }
+
+    function _buy(uint256 minTokensOut) private {
         require(!graduated, "adapter curve: graduated");
         require(msg.value > 0, "adapter curve: zero value");
         uint256 fee = (msg.value * TRADE_FEE_BPS) / 10_000;
@@ -206,6 +225,15 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
     }
 
     function sell(uint256 tokensIn, uint256 minEthOut) external nonReentrant {
+        _sell(tokensIn, minEthOut);
+    }
+
+    function sellWithDeadline(uint256 tokensIn, uint256 minEthOut, uint256 deadline) external nonReentrant {
+        require(block.timestamp <= deadline, "adapter curve: expired");
+        _sell(tokensIn, minEthOut);
+    }
+
+    function _sell(uint256 tokensIn, uint256 minEthOut) private {
         require(!graduated, "adapter curve: graduated");
         require(tokensIn > 0, "adapter curve: zero tokens");
         uint256 newTokenReserve = tokenReserve + tokensIn;
@@ -226,11 +254,41 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
         emit Sold(msg.sender, tokensIn, ethOut, fee);
     }
 
+    /// @notice Fund the terminal rounding plateau and graduate, receiving no tokens.
+    /// @dev Ordinary buys continue to reject zero output. The caller must explicitly
+    ///      choose this path and send exactly graduationBuyAmount() before the deadline.
+    ///      Coarse token units can make the remaining funding substantial.
+    function completeGraduation(uint256 deadline) external payable nonReentrant {
+        require(block.timestamp <= deadline, "adapter curve: expired");
+        require(!graduated, "adapter curve: graduated");
+        uint256 remaining = uint256(GRAD_ETH) - realEthCollected;
+        require(remaining > 0 && realEthCollected > 0, "adapter curve: completion not needed");
+        uint256 targetEthReserve = ethReserve + remaining;
+        require(tokenReserve == Math.ceilDiv(K, targetEthReserve), "adapter curve: completion not needed");
+        require(msg.value == _graduationBuyAmount(), "adapter curve: wrong completion value");
+        uint256 fee = (msg.value * TRADE_FEE_BPS) / 10_000;
+        require(msg.value - fee == remaining, "adapter curve: wrong completion value");
+        ethReserve = targetEthReserve;
+        realEthCollected = GRAD_ETH;
+        (bool paid,) = TREASURY.call{value: fee}("");
+        require(paid, "adapter curve: fee send failed");
+        emit GraduationCompleted(msg.sender, msg.value, fee, 0);
+        _graduate();
+    }
+
     function _graduate() private {
         ArchToken launched = token;
-        uint256 tokensToLp = launched.balanceOf(address(this));
+        uint256 tokensToLp = tokenReserve + LP_SUPPLY;
+        uint256 actualInventory = launched.balanceOf(address(this));
+        require(actualInventory >= tokensToLp, "adapter curve: token inventory mismatch");
+        uint256 donatedTokens = actualInventory - tokensToLp;
+        if (donatedTokens > 0) {
+            IERC20(address(launched)).safeTransfer(DEAD, donatedTokens);
+            emit DonatedTokensBurned(donatedTokens);
+        }
         uint256 ethToLp = realEthCollected;
         WETH.deposit{value: ethToLp}();
+        uint256 wethBefore = IERC20(address(WETH)).balanceOf(address(this));
         launched.approve(address(LIQUIDITY_ADAPTER), tokensToLp);
         IERC20(address(WETH)).forceApprove(address(LIQUIDITY_ADAPTER), ethToLp);
         IArchLaunchLiquidityAdapter.SeedResult memory seeded = LIQUIDITY_ADAPTER.seed(
@@ -247,6 +305,11 @@ contract ArchAdapterBondingCurve is ReentrancyGuard {
         IERC20(address(WETH)).forceApprove(address(LIQUIDITY_ADAPTER), 0);
         require(seeded.tokenUsed > 0 && seeded.wethUsed > 0, "adapter curve: empty seed");
         require(seeded.tokenUsed <= tokensToLp && seeded.wethUsed <= ethToLp, "adapter curve: seed overflow");
+        require(
+            launched.balanceOf(address(this)) == tokensToLp - seeded.tokenUsed
+                && IERC20(address(WETH)).balanceOf(address(this)) == wethBefore - seeded.wethUsed,
+            "adapter curve: seed accounting mismatch"
+        );
 
         graduated = true;
         pair = seeded.market;
